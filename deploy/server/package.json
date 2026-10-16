@@ -1,0 +1,17 @@
+{
+  "name": "cpubiomed-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "药大生医初试复习台 · 自建题库接口",
+  "scripts": {
+    "start": "node index.mjs",
+    "seed": "node seed.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "pg": "8.13.1"
+  }
+}
