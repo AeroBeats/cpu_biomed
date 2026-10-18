@@ -63,6 +63,47 @@ docker compose version          # 能打印版本就行
 
 ---
 
+## 3b. 拉不动镜像（国内服务器几乎必踩）
+
+本项目要拉三个 Docker Hub 官方镜像：`nginx:1.27-alpine`、`postgres:16-alpine`、
+`node:20-alpine`。国内服务器直连 Docker Hub 通常超时或被重置，表现是
+`docker compose up --build` 卡在 `pulling ...` 或报 `i/o timeout` / `connection reset`。
+
+配一个镜像加速器就行。公共加速源经常失效，所以用仓库里的探测脚本让服务器自己挑：
+
+```bash
+# 先看哪些源活着，不改系统
+bash deploy/tools/fix-docker-mirror.sh --probe
+
+# 确认后真正配置（会真实拉一次 nginx 验证，然后合并写入 daemon.json 并重启 docker）
+bash deploy/tools/fix-docker-mirror.sh
+```
+
+脚本会用 python3 合并 `/etc/docker/daemon.json`，不会覆盖你已有的
+`log-opts`、`data-root` 等配置，改之前自动备份成 `daemon.json.bak.<时间戳>`。
+
+**最可靠的一条路**是用你云厂商自己的加速地址（腾讯云/阿里云/华为云控制台里都有，
+形如 `https://xxxxxxxx.mirror.aliyuncs.com`），它走内网，不受公共源限流影响：
+
+```bash
+EXTRA_MIRRORS='https://xxxxxxxx.mirror.aliyuncs.com' bash deploy/tools/fix-docker-mirror.sh
+```
+
+如果连加速器都配不上，还有个不依赖 daemon 配置的笨办法——手动带前缀拉再改名，
+compose 之后会直接命中本地缓存：
+
+```bash
+M=https://docker.m.daocloud.io
+docker pull $M/library/nginx:1.27-alpine    && docker tag $M/library/nginx:1.27-alpine    nginx:1.27-alpine
+docker pull $M/library/postgres:16-alpine   && docker tag $M/library/postgres:16-alpine   postgres:16-alpine
+docker pull $M/library/node:20-alpine       && docker tag $M/library/node:20-alpine       node:20-alpine
+```
+
+> 装 Docker 本身如果也卡住（`get.docker.com` 拉不动），改用阿里云的 docker-ce 源，
+> 或者先在能翻墙的机器上 `docker save` 出 tar 包再 `scp` 上去 `docker load`。
+
+---
+
 ## 4. 上传代码
 
 服务器上只需要 `web/` 和 `deploy/` 两个目录，且**必须保持同级**

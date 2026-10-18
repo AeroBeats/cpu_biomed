@@ -1,0 +1,7 @@
+# 这几类文件会在 Linux 上被直接执行或解析，带上 CRLF 会报 bad interpreter / 解析失败，
+# 所以强制 LF。其余文件仍按各人 core.autocrlf 处理。
+*.sh          text eol=lf
+Dockerfile    text eol=lf
+*.conf        text eol=lf
+*.env         text eol=lf
+.env.example  text eol=lf
