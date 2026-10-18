@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>药大生医 · 初试复习台</title>
+<meta name="description" content="中国药科大学生物与医药（0860）考研初试复习工具，覆盖 338 生物化学、811 分析化学、101 思想政治理论、201 英语一：刷题训练、错题本、背诵卡、考纲考点与复习计划进度追踪。">
+<meta name="theme-color" content="#12313A">
+<meta property="og:title" content="药大生医 · 初试复习台">
+<meta property="og:description" content="338 生物化学 · 811 分析化学 · 101 思想政治理论 · 201 英语一，一站式初试备考工具。">
+<meta property="og:type" content="website">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2312313A'/%3E%3Cpath d='M11 7v7.2L7.6 21a2.6 2.6 0 0 0 2.3 3.9h12.2a2.6 2.6 0 0 0 2.3-3.9L21 14.2V7' fill='none' stroke='%2349B39E' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M10 7h12M9.4 19.5h13.2' stroke='%2349B39E' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="app" id="app">
+  <a class="skip-link" href="#view">跳到主要内容</a>
+
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32" width="30" height="30"><path d="M11 6v7.4L7.4 21A2.7 2.7 0 0 0 9.8 25h12.4a2.7 2.7 0 0 0 2.4-4L21 13.4V6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M9.6 6h12.8M9 19.6h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      </div>
+      <div class="brand-text">
+        <strong>药大生医 · 初试复习台</strong>
+        <span>中国药科大学 生物与医药（0860）</span>
+      </div>
+    </div>
+
+    <nav class="nav" aria-label="主导航">
+      <ul id="navList"></ul>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="streak" id="streakBox">
+        <span class="streak-num" id="streakNum">0</span>
+        <span class="streak-label">连续打卡<br>天</span>
+      </div>
+      <p class="foot-note">学习进度保存在本机浏览器；题库与考纲内容可在「内容管理」中同步到云端。</p>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <button class="menu-btn" id="menuBtn" aria-label="打开导航" aria-expanded="false">
+        <svg viewBox="0 0 24 24" width="22" height="22"><path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      </button>
+      <div class="topbar-title" id="topbarTitle">总览</div>
+      <div class="countdown" id="countdown" title="点击可修改考试日期">
+        <span class="cd-label">距初试</span>
+        <span class="cd-num" id="cdNum">--</span>
+        <span class="cd-unit">天</span>
+      </div>
+    </header>
+    <div class="view" id="view" tabindex="-1"></div>
+  </main>
+</div>
+
+<div class="scrim" id="scrim" hidden></div>
+
+<script src="data/syllabus.js"></script>
+<script src="data/questions.js"></script>
+<script src="data/flashcards.js"></script>
+<script src="data/plan.js"></script>
+<script src="data/questions_extra.js"></script>
+<script src="data/cards_extra.js"></script>
+<script src="api.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

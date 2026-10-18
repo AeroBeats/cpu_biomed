@@ -1,0 +1,44 @@
+# ---- 机密：明文口令，绝不能进版本库 ----
+# deploy/.env 里是站点访问口令和数据库口令
+.env
+
+# ---- 迁移中间产物 ----
+# 内含从 Qoder 云端导出的题库，以及你个人的学习进度（刷题记录、错题本、打卡天数）
+deploy/migrate/
+
+# ---- TLS 证书与续期挑战文件 ----
+deploy/nginx/certbot/
+*.pem
+*.key
+*.crt
+*.pfx
+
+# ---- 数据库备份 ----
+*.sql.gz
+*.dump
+backup-*.sql
+
+# ---- Qoder 生成的部署描述符 ----
+# 本机与云端项目的绑定状态，换机器应由 prepare_site 重新生成，不要提交
+*.qoder.site
+
+# ---- 依赖与构建产物 ----
+node_modules/
+npm-debug.log*
+yarn-error.log*
+__pycache__/
+*.pyc
+
+# ---- 原始考研资料 ----
+# PDF/TXT 原书与真题扫描件版权敏感，正常放在项目外的 _materials/，这里防御性忽略，
+# 避免哪天被拷进项目目录后误提交
+_materials/
+*.pdf
+
+# ---- 系统与编辑器 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp

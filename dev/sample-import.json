@@ -1,0 +1,49 @@
+{
+  "format": "cpu-biomed-bank/1",
+  "questions": [
+    {
+      "id": "imp-ana-1",
+      "subject": "ana",
+      "chapter": "酸碱滴定法",
+      "qtype": "single",
+      "level": 3,
+      "tags": ["导入测试", "高频"],
+      "stem": "用 0.1000 mol/L NaOH 滴定 0.1000 mol/L HAc（Ka = 1.8×10⁻⁵），化学计量点时溶液的 pH 约为（）",
+      "opts": ["7.00", "8.72", "5.28", "10.00"],
+      "answer": 1,
+      "explain_text": "化学计量点生成 NaAc，为弱碱溶液。c(Ac⁻) ≈ 0.05000 mol/L，[OH⁻] = √(Kb·c) = √(5.6×10⁻¹⁰ × 0.05) ≈ 5.3×10⁻⁶，pOH ≈ 5.28，pH ≈ 8.72。",
+      "source": "导入测试"
+    },
+    {
+      "id": "imp-eng-1",
+      "subject": "eng",
+      "chapter": "完形填空",
+      "qtype": "blank",
+      "level": 2,
+      "tags": ["导入测试"],
+      "stem": "The new drug was ___ approved after the third phase of clinical trials.",
+      "opts": [],
+      "answer": "officially / formally",
+      "explain_text": "副词修饰 approved，语义上是「正式获批」。officially 与 formally 均可。",
+      "source": "导入测试"
+    }
+  ],
+  "chapters": [
+    {
+      "id": "ch-imp-ana-1",
+      "subject": "ana",
+      "name": "导入测试章节",
+      "weight": 5,
+      "points": ["导入考点一", "导入考点二"]
+    }
+  ],
+  "cards": [
+    {
+      "id": "imp-card-1",
+      "subject": "ana",
+      "chapter": "酸碱滴定法",
+      "front": "弱酸能被强碱准确滴定的判据是什么？",
+      "back": "**c·Ka ≥ 10⁻⁸**\n满足时滴定突跃足够大，可用指示剂判断终点。"
+    }
+  ]
+}
