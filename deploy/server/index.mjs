@@ -13,6 +13,8 @@ import { AppError } from './validate.mjs';
 import { loadContent, seedIfEmpty } from './seed.mjs';
 
 const PORT = Number(process.env.PORT || 8080);
+// 原生部署时设成 127.0.0.1，让题库接口只能经 nginx 到达；容器部署不发布端口，保持默认即可。
+const HOST = process.env.HOST || '0.0.0.0';
 const SITE_ROOT = path.resolve(process.env.SITE_ROOT || '../../web');
 const API_PATH = '/functions/v1/app';
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
@@ -178,7 +180,7 @@ async function main() {
   }
 
   const server = createServer({ db, auth });
-  server.listen(PORT, () => console.log(`复习台服务已启动，监听 ${PORT}，静态目录 ${SITE_ROOT}`));
+  server.listen(PORT, HOST, () => console.log(`复习台服务已启动，监听 ${HOST}:${PORT}，静态目录 ${SITE_ROOT}`));
 
   const shutdown = () => {
     server.close(async () => {

@@ -5,6 +5,16 @@ Qoder 站点保留但不再更新，作为回退备份。
 
 迁移范围：前端页面 + 题库后台接口 + 数据库结构 + 现有内容（353 题 / 32 章 / 89 卡）。
 
+> **两条部署路线，先选一条：**
+>
+> - **Docker Compose**（第 3–6 节）—— 一条命令起三个容器，最省事，但要从 Docker Hub
+>   拉 `nginx` / `postgres` / `node` 三个镜像。**国内服务器经常拉不动**，见第 3b 节。
+> - **原生部署**（第 3c 节）—— Node + 发行版 PostgreSQL + nginx + systemd，
+>   **完全不碰 Docker Hub**，只需要 apt 和 npmmirror 能通。国内服务器建议直接走这条。
+>
+> 两条路线跑的是**同一份代码**（`deploy/server/`），前端一行都不用改，
+> 数据迁移（第 7 节）、备份、加题目的方式也完全一样，只有起停命令不同。
+
 ---
 
 ## 1. 迁移后有什么变化
@@ -14,7 +24,7 @@ Qoder 站点保留但不再更新，作为回退备份。
 | 前端 | 平台托管的静态文件 | nginx 反代 → Node 直接托管 `web/` |
 | 题库接口 | Deno Function，路径 `/functions/v1/app` | Node 服务，**路径不变**，所以前端一行没改 |
 | 登录方式 | Qoder 账号，由平台网关判定身份 | HTTP Basic 口令，打开站点时浏览器弹窗输入一次 |
-| 数据库 | 平台托管的 PostgreSQL（`app` schema） | 你自己的 PostgreSQL 16 容器（`public` schema） |
+| 数据库 | 平台托管的 PostgreSQL（`app` schema） | 你自己的 PostgreSQL（`public` schema），容器或系统服务均可 |
 | 访问控制 | 站点设为私有，只有受邀者能进 | 整站（含静态文件）都在口令之后 |
 | 学习进度 | 存在浏览器 localStorage，绑定 qoder.website 域名 | 存在浏览器 localStorage，绑定你的新域名 |
 
@@ -29,16 +39,21 @@ Qoder 站点保留但不再更新，作为回退备份。
 
 ```
 deploy/
-├── docker-compose.yml      nginx + api + postgres 三个服务
-├── schema.sql              建表语句，数据库首次初始化时自动执行
-├── .env.example            口令模板，复制成 .env 后填写
-├── nginx/site.conf         反向代理配置，含 HTTPS 段落（默认注释）
-├── server/                 Node 服务（认证 / 静态托管 / 题库接口 / 首启灌入）
+├── docker-compose.yml      【Docker 路线】nginx + api + postgres 三个服务
+├── schema.sql              建表语句，两条路线共用
+├── .env.example            口令模板，复制成 .env 后填写，两条路线共用
+├── nginx/site.conf         【Docker 路线】反向代理配置，含 HTTPS 段落（默认注释）
+├── native/                 【原生路线】不用 Docker 的安装套件
+│   ├── install.sh          一键安装：Node + PostgreSQL + nginx + systemd
+│   ├── cpubiomed.service   systemd 服务单元模板
+│   └── nginx-site.conf     反向代理配置，upstream 指向 127.0.0.1:8080
+├── server/                 Node 服务（认证 / 静态托管 / 题库接口 / 首启灌入），两条路线共用
 │   └── content.json        种子数据，由 tools/build-seed.mjs 生成
 ├── tools/
 │   ├── build-seed.mjs      从 web/data 重新生成 content.json
 │   ├── export-from-qoder.js  在 Qoder 站点控制台里运行，导出云端题库 + 进度
-│   └── import-bundle.mjs   把导出文件转成 content.json 和进度恢复脚本
+│   ├── import-bundle.mjs   把导出文件转成 content.json 和进度恢复脚本
+│   └── fix-docker-mirror.sh  【Docker 路线】探测可用的镜像加速器
 └── migrate/                导出/恢复用的中间文件（运行工具后生成）
 ```
 
@@ -82,12 +97,15 @@ bash deploy/tools/fix-docker-mirror.sh
 脚本会用 python3 合并 `/etc/docker/daemon.json`，不会覆盖你已有的
 `log-opts`、`data-root` 等配置，改之前自动备份成 `daemon.json.bak.<时间戳>`。
 
-**最可靠的一条路**是用你云厂商自己的加速地址（腾讯云/阿里云/华为云控制台里都有，
-形如 `https://xxxxxxxx.mirror.aliyuncs.com`），它走内网，不受公共源限流影响：
+也可以直接用你云厂商控制台给的加速地址（形如 `https://xxxxxxxx.mirror.aliyuncs.com`）：
 
 ```bash
 EXTRA_MIRRORS='https://xxxxxxxx.mirror.aliyuncs.com' bash deploy/tools/fix-docker-mirror.sh
 ```
+
+> **注意**：阿里云的「个人版」镜像加速器已经不再代理任意 Docker Hub 镜像了，
+> 拉公共镜像会报 `not found`（不是超时，是它明确告诉你没有这个镜像）。
+> 这不是你配错了，也换不掉。腾讯云 `mirror.ccs.tencentyun.com` 只在腾讯云内网可达，同样可能受限。
 
 如果连加速器都配不上，还有个不依赖 daemon 配置的笨办法——手动带前缀拉再改名，
 compose 之后会直接命中本地缓存：
@@ -101,6 +119,60 @@ docker pull $M/library/node:20-alpine       && docker tag $M/library/node:20-alp
 
 > 装 Docker 本身如果也卡住（`get.docker.com` 拉不动），改用阿里云的 docker-ce 源，
 > 或者先在能翻墙的机器上 `docker save` 出 tar 包再 `scp` 上去 `docker load`。
+
+**上面这些都不行的话，别继续耗了，直接走第 3c 节。** 这个项目对容器没有任何真实依赖：
+后端就是个原生 Node 应用、只有一个 `pg` 依赖，数据库用发行版自带的 PostgreSQL 就行。
+Docker Hub 是这条路上唯一的死结，绕开它比打通它容易得多。
+
+---
+
+## 3c. 原生部署（不用 Docker，国内服务器推荐）
+
+**适用条件**：Debian / Ubuntu，能访问 apt 源和 `registry.npmmirror.com`。先确认：
+
+```bash
+curl -s -o /dev/null -w 'apt 源     %{http_code}\n' --max-time 10 http://deb.debian.org/debian/
+curl -s -o /dev/null -w 'npmmirror %{http_code}\n' --max-time 15 https://registry.npmmirror.com/pg
+```
+
+两个都不是 `000` 就能走这条路。
+
+**安装脚本会做这些事**：从 npmmirror 下载 Node 20 官方二进制（带 sha256 校验）→
+用发行版 PostgreSQL 建库建表 → 把 `web/` 和 `deploy/` 复制到 `/opt/cpubiomed` →
+`npm install` 装 `pg` → 写 systemd 服务（专用低权限用户、只读运行、开机自启）→
+装 nginx 反代并开 gzip → 自检并打印题库条数。
+
+```bash
+# 1. 上传代码（在你自己电脑上执行）
+scp -r web deploy <user>@<ip>:~/cpubiomed/
+
+# 2. 登录服务器配口令（和第 5 节完全一样，两条路线共用这个 .env）
+cd ~/cpubiomed
+cp deploy/.env.example deploy/.env && chmod 600 deploy/.env
+openssl rand -hex 24    # 跑两次，分别填 ADMIN_PASSWORD 和 POSTGRES_PASSWORD
+nano deploy/.env
+
+# 3. 一键安装
+sudo bash deploy/native/install.sh
+```
+
+装完脚本会自己跑一遍自检，看到 `✓ 题库 353 题 / 32 章节 / 89 卡` 就成了。
+接着按第 6 节的验证清单在浏览器里过一遍（除了 `docker compose` 那几条，其余都适用）。
+
+**几个要知道的点**：
+
+- **幂等**：`install.sh` 可以重复执行，也是日后的更新方式。它只替换 `/opt/cpubiomed`
+  下的代码，**不动数据库**——你在后台加的题、改过的内容都还在。
+- **口令落盘位置**：`deploy/.env` 只在安装时用一次。脚本会生成
+  `/etc/cpubiomed/cpubiomed.env`（权限 600，仅 root 可读）给 systemd 用，
+  并**删掉复制进 `/opt` 的那份 `.env`**。
+- **口令格式**：只允许字母和数字。脚本会拦下 base64 和带特殊字符的口令——
+  它们要拼进 `DATABASE_URL` 连接串，特殊字符会被解析错。用 `openssl rand -hex 24`。
+- **题库接口只监听 `127.0.0.1:8080`**，公网流量必须经 nginx。安全组仍只放行 22 和 80/443。
+- **PostgreSQL 版本无所谓**：Debian 13 自带 17，`schema.sql` 全是基础类型和
+  `IF NOT EXISTS`，16/17 都能跑；已有数据的实例不会被覆盖。
+- **前端内容更新**：`web/` 是复制过去的，不像 Docker 那样挂载，所以改完要重跑
+  `sudo bash deploy/native/install.sh`（或直接 `scp` 覆盖 `/opt/cpubiomed/web/`）。
 
 ---
 
@@ -116,6 +188,9 @@ scp -r web deploy <user>@<ip>:~/cpubiomed/
 
 注意：`deploy/server/content.json` 是构建镜像时要打进包里的，别漏。
 `.env` 不要上传，下一步在服务器上直接生成。
+
+> 第 4–6 节是 **Docker 路线**。走原生部署的话，上传和配口令已经在第 3c 节里做过了，
+> 只需要看第 6 节的「验证清单」，日常维护看第 9 节的原生部分。
 
 ---
 
@@ -154,6 +229,15 @@ cd ~/cpubiomed/deploy
 docker compose up -d --build
 docker compose ps            # 三个服务都应是 running / healthy
 docker compose logs -f api   # 看到「复习台服务已启动」和「初始化灌入 474 条记录」
+```
+
+原生部署（第 3c 节）的对应命令，`install.sh` 已经替你跑完了，这里只是日后排查用：
+
+```bash
+systemctl status cpubiomed                       # active (running)
+journalctl -u cpubiomed -f                       # 看到「复习台服务已启动」和「初始化灌入 474 条记录」
+curl -s http://127.0.0.1:8080/healthz            # {"ok":true}
+sudo systemctl restart cpubiomed                 # 改了 deploy/server/ 下的代码后
 ```
 
 首次启动时数据库是空的，api 容器会自动把 `content.json` 灌进去（353 题 + 32 章 + 89 卡 = 474 条）。
@@ -212,7 +296,12 @@ curl -s -u "$ADMIN_USER:$ADMIN_PASSWORD" 'http://localhost/functions/v1/app?acti
 
 ```bash
 scp deploy/server/content.json <user>@<ip>:~/cpubiomed/deploy/server/
+
+# Docker 路线
 ssh <user>@<ip> 'cd ~/cpubiomed/deploy && docker compose up -d --build api'
+
+# 原生路线：重跑安装脚本即可（幂等，不动数据库）
+ssh <user>@<ip> 'cd ~/cpubiomed && sudo bash deploy/native/install.sh'
 ```
 
 > 不想开控制台的话，网站「内容管理」里本来就有「导出全部内容 JSON」按钮，
@@ -225,9 +314,16 @@ ssh <user>@<ip> 'cd ~/cpubiomed/deploy && docker compose up -d --build api'
 
 ```bash
 # 会删掉新服务器上所有题目和后台编辑，确认后再执行
+
+# Docker 路线
 docker compose exec db psql -U cpubiomed -d cpubiomed \
   -c 'TRUNCATE questions, syllabus_chapters, cards RESTART IDENTITY;'
 docker compose restart api
+
+# 原生路线
+sudo -u postgres psql -d cpubiomed \
+  -c 'TRUNCATE questions, syllabus_chapters, cards RESTART IDENTITY;'
+sudo systemctl restart cpubiomed
 ```
 
 ---
@@ -258,6 +354,20 @@ docker compose restart web
 sudo certbot renew --deploy-hook "docker compose -f ~/cpubiomed/deploy/docker-compose.yml restart web"
 ```
 
+上面是 Docker 路线。**原生部署反而简单得多**——nginx 直接读 `/etc/letsencrypt`，
+不用挂载、不用改 compose：
+
+```bash
+# 1. 域名 A 记录指向服务器 IP，等生效
+sudo apt install -y certbot python3-certbot-nginx
+
+# 2. 让 certbot 自己改 nginx 配置（会自动加 443 段和跳转）
+sudo certbot --nginx -d your-domain.example --agree-tos -m you@example.com
+
+# 续期由 certbot 的 systemd timer 自动处理，重载钩子它自己会加
+sudo certbot renew --dry-run
+```
+
 ---
 
 ## 9. 日常维护
@@ -277,15 +387,32 @@ docker compose exec -T db pg_dump -U cpubiomed -d cpubiomed | gzip > backup-$(da
 gunzip -c backup-2026-10-16.sql.gz | docker compose exec -T db psql -U cpubiomed -d cpubiomed
 ```
 
-**改前端内容**（`web/` 下的文件）：`web/` 是以只读方式挂进容器的，改完刷新页面就生效，
-不用重启、不用重建镜像。
+原生部署（第 3c 节）的对应命令：
+
+```bash
+journalctl -u cpubiomed -f                      # 看接口日志
+sudo tail -f /var/log/nginx/access.log          # 看 nginx 访问日志
+sudo systemctl restart cpubiomed                # 改了 deploy/server/ 下的代码后
+cd ~/cpubiomed && sudo bash deploy/native/install.sh   # 改了 package.json / content.json / web/ 后
+
+# 备份数据库（建议配个 cron，每天一份，留最近 14 天）
+sudo -u postgres pg_dump cpubiomed | gzip > backup-$(date +%F).sql.gz
+
+# 恢复
+gunzip -c backup-2026-10-19.sql.gz | sudo -u postgres psql cpubiomed
+```
+
+**改前端内容**（`web/` 下的文件）：Docker 路线下 `web/` 是只读挂载进容器的，改完刷新页面
+就生效；原生路线下 `web/` 是复制到 `/opt/cpubiomed/web` 的，要重跑一次 `install.sh`
+（或直接覆盖那个目录下的文件）。两条路都不用碰数据库。
 
 **加题目**有两条路：
 - 在网站的「内容管理」里手动加 —— 立即生效，只进数据库；
 - 改 `web/data/questions_extra.js` 之类的内容文件 —— 静态兜底数据变了，但**数据库不会自动跟着变**，
   需要在「内容管理」里点一次「一键上传」（只插不改，不会覆盖你已有的编辑）。
 
-**改口令**：编辑 `.env` 里的 `ADMIN_PASSWORD`，然后 `docker compose up -d api`。
+**改口令**：编辑 `deploy/.env` 里的 `ADMIN_PASSWORD`，然后 Docker 路线跑
+`docker compose up -d api`、原生路线重跑 `sudo bash deploy/native/install.sh`。
 所有者身份固定记作 `admin`，改用户名或口令都不会把自己锁在门外。
 
 ---
@@ -302,13 +429,23 @@ Qoder 站点还在，随时可以用 https://cpu-biomed-q1r9t5025uh.qoder.websit
 
 - **本地验证做到哪一步**：接口逻辑用内存数据库替身跑过 93 项断言（认证、路径穿越防护、
   全部 action、全部字段校验、353 条真实种子数据灌入、幂等性、后台编辑不被覆盖），全部通过。
-  **但没有在真实 Docker / 真实 PostgreSQL / 真实 nginx 上跑过**，本机没装 Docker。
+  **但没有在真实 PostgreSQL / 真实 nginx 上跑过**，本机既没装 Docker 也没有 Linux 环境。
   第 6 节的验证清单第一次在服务器上执行时，才是真正的端到端确认。
+- **原生安装脚本 `deploy/native/install.sh` 同样没有实机跑过**。本机验证到的是：
+  bash 语法检查通过；`.env` 解析与 15 组输入逐个实测（10 组应被拦下的：模板占位文字、
+  口令过短、base64 特殊字符、缺字段、非数字端口、用户名带空格、库名含引号或分号、
+  角色名数字开头或含连字符；5 组应放行的：合法配置、CRLF 行尾、省略 HTTP_PORT、
+  值里含等号、下划线加数字的库名）；npmmirror 的 Node 20 清单能解析出
+  `node-v20.19.5-linux-x64.tar.xz` 与 arm64 对应包、sha256 校验行格式与 `sha256sum -c`
+  兼容；systemd 单元与 nginx 配置的占位符替换无残留。
+  **apt 安装、建库建表、systemd 启动、nginx 反代这四步只有静态审查。**
 - **nginx 与 TLS 配置未经实机验证**，证书路径和续期钩子可能要按你的发行版微调。
 - **前端有一处文案对不上**：`web/api.js` 里 401 的提示写的是「需要先登录 Qoder 账号」。
   自建部署下浏览器在打开页面时就已经弹过口令框了，正常操作走不到这个分支；
   万一看到这句话，实际含义是「口令没填对或被清掉了」。
-- **内容版权**：题库里有真题和商业习题册的题目，默认整站加口令、不对外开放。
-  别把它做成公开站点，也别分享给不特定人群。
+- **内容版权**：题库里有真题和商业习题册的题目，所以**运行中的站点**默认整站加口令、
+  不对外开放，别把它做成公开站点，也别分享给不特定人群。
+  （代码仓库 `github.com/AeroBeats/cpu_biomed` 是公开的，里面含全量题库——这是你
+  2026-10-18 明确选择的，与站点是否公开是两件事。）
 - **口令强度**：HTTP Basic 在明文 HTTP 上等于把口令直接发出去。上 HTTPS 之前，
   `ADMIN_PASSWORD` 请当成随时可换的临时口令。

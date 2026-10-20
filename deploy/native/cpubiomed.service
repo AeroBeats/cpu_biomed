@@ -1,0 +1,30 @@
+[Unit]
+Description=药大生医初试复习台
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=__USER__
+Group=__USER__
+WorkingDirectory=__APP_DIR__/deploy/server
+EnvironmentFile=/etc/cpubiomed/cpubiomed.env
+ExecStart=__NODE_BIN__ index.mjs
+
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=60
+
+# 只读运行：服务不需要写任何目录，日志走 journald
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
