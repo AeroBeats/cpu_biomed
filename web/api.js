@@ -1,7 +1,12 @@
 /* ============================================================
-   云端题库接口层 · 药大生医初试复习台
-   同源调用站点 Function（逻辑名 app），失败时回落到内置数据。
-   进度数据仍存本地 localStorage，云端只承载「内容」。
+   云端接口层 · 药大生医初试复习台
+   同源调用站点后端（逻辑名 app），失败时回落到内置数据。
+
+   同一份前端要能跑在两种后端上：
+   · gateway —— Qoder Sites，身份由平台网关给，只有 bank / owner / claim-owner；
+   · accounts —— 自建服务器，有登录页、角色和进度同步。
+   用 detectMode() 探一次 ?action=session 来区分：自建后端认得它，
+   Qoder 的 Function 会回 not_found，那就是 gateway。
    ============================================================ */
 
 window.Cloud = (function () {
@@ -27,7 +32,11 @@ window.Cloud = (function () {
 
   // 提示文案由本文件按已知公开错误码给出，绝不直接展示服务端原文。
   var MESSAGES = {
-    login_required: '需要先登录 Qoder 账号，才能使用题库后台管理。',
+    login_required: '这个操作需要先登录。',
+    bad_credentials: '用户名或口令不对，请重试。',
+    username_taken: '这个用户名已经被占用，换一个吧。',
+    not_admin: '当前账号没有管理权限，只能浏览内容和同步自己的进度。',
+    progress_too_large: '进度数据太大，无法同步到服务器。',
     invalid_user_context: '登录状态校验失败，请刷新页面后重试。',
     owner_not_claimed: '还没有启用后台管理，请先点击「启用后台管理」。',
     owner_exists: '后台管理已由其他账号启用，当前账号无法修改题库。',
@@ -183,6 +192,20 @@ window.Cloud = (function () {
     return { QB: QB, CARDS: CARDS, SYLLABUS: SYLLABUS };
   }
 
+  /* ---------------- 后端形态探测 ---------------- */
+
+  // accounts：自建服务器，有登录页 / 角色 / 进度同步。
+  // gateway：Qoder Sites，身份来自平台网关，没有这些动作。
+  // 探测失败（断网、5xx）时按 accounts 处理并当作未登录，页面仍能用内置数据。
+  function detectMode() {
+    return get('session').then(function (s) {
+      return { mode: 'accounts', loggedIn: !!s.loggedIn, user: s.user || null };
+    }, function (e) {
+      if (e && e.code === 'not_found') return { mode: 'gateway' };
+      return { mode: 'accounts', loggedIn: false, user: null, error: e };
+    });
+  }
+
   /* ---------------- 对外接口 ---------------- */
 
   return {
@@ -193,7 +216,36 @@ window.Cloud = (function () {
     chapterId: chapterId,
     flattenBuiltin: flattenBuiltin,
     toAppData: toAppData,
+    detectMode: detectMode,
     loadBank: function () { return get('bank'); },
+    session: function () { return get('session'); },
+    login: function (username, password) {
+      return post('login', { username: username, password: password });
+    },
+    register: function (username, password, displayName) {
+      var body = { username: username, password: password };
+      if (displayName) body.display_name = displayName;
+      return post('register', body);
+    },
+    logout: function () { return post('logout', {}); },
+    loadProgress: function () { return get('progress'); },
+    saveProgress: function (data) { return post('progress', { data: data }); },
+    // 关页面时来不及等一次往返，用 beacon / keepalive 把最后一份快照丢出去。
+    // 发得出去不代表服务器收下了，所以它只用来兜底，不更新同步状态。
+    saveProgressNow: function (data) {
+      var body = JSON.stringify({ data: data });
+      if (navigator.sendBeacon) {
+        return navigator.sendBeacon(FN + '?action=progress', new Blob([body], { type: 'application/json' }));
+      }
+      try {
+        fetch(FN + '?action=progress', {
+          method: 'POST', keepalive: true, credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+          body: body
+        });
+        return true;
+      } catch (e) { return false; }
+    },
     ownerState: function () { return get('owner'); },
     claimOwner: function () { return post('claim-owner', {}); },
     syncBuiltin: function () { return post('sync-builtin', flattenBuiltin()); },

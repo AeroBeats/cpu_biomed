@@ -1,6 +1,7 @@
 /* ============================================================
    药大生医 · 初试复习台 — 应用主逻辑
-   纯静态单页应用，hash 路由，进度保存在 localStorage
+   单页应用，hash 路由。浏览和做题都不需要登录；
+   进度以 localStorage 为主，登录后再往服务器备一份快照。
    ============================================================ */
 
 (function () {
@@ -20,6 +21,12 @@
       } catch (e) { return def; }
     },
     set: function (k, v) {
+      Store.setQuiet(k, v);
+      scheduleSync();
+    },
+    // 同步簿记（savedAt）与「刚把远端进度写回本地」这两种写入不能再排一次上传，
+    // 否则会自己触发自己，形成回环。
+    setQuiet: function (k, v) {
       try { localStorage.setItem(NS + k, JSON.stringify(v)); } catch (e) { /* 存储不可用时静默降级 */ }
     }
   };
@@ -43,6 +50,9 @@
     talkSetup: { subject: 'bio', source: 'mix', scope: 'all', count: 8 },
     source: 'builtin',                     // 'builtin' 内置数据 | 'cloud' 云端题库
     cloud: { status: 'loading' },          // loading | ready | empty | error
+    // 自建服务器：mode 'accounts'，有登录页、角色和进度同步。
+    account: { mode: 'accounts', status: 'loading', user: null, form: 'login', busy: false, msg: null },
+    // Qoder 站点：mode 'gateway'，身份由平台网关给，只有「站点所有者」这一个概念。
     owner: { status: 'loading' },          // loading | anon | unclaimed | owner | other | error
     admin: { tab: 'questions', subject: 'bio', q: '', editing: null, busy: false, msg: null },
     route: 'dashboard'
@@ -235,6 +245,147 @@
     });
   }
 
+  function isLoggedIn() { return !!(state.account.user); }
+  function isAdmin() {
+    if (state.account.status !== 'ready') return false;
+    return state.account.mode === 'accounts'
+      && !!(state.account.user && state.account.user.role === 'admin');
+  }
+  // gateway（Qoder 站点）没有角色概念，「启用后台管理」这一步就发生在内容管理页里，
+  // 入口必须一直可见，否则所有者自己也启不起来。
+  function canSeeAdmin() {
+    return state.account.mode === 'gateway' ? true : isAdmin();
+  }
+  // 能不能往内容表里写：gateway 看是不是站点所有者，accounts 看角色。
+  function canWriteContent() {
+    if (state.account.status !== 'ready') return false;
+    return state.account.mode === 'gateway' ? state.owner.status === 'owner' : isAdmin();
+  }
+
+  // 先探后端形态，再按形态取身份；两种后端共用 isAdmin() 这一个判断。
+  function loadIdentity() {
+    state.account.status = 'loading';
+    return window.Cloud.detectMode().then(function (d) {
+      state.account.mode = d.mode;
+      if (d.mode === 'gateway') return loadOwner();
+      state.account.user = d.user || null;
+      // 探测失败时页面照样能用内置内容，只在账号页把原因说出来。
+      state.account.msg = d.error ? { kind: 'err', text: d.error.message } : null;
+      return undefined;
+    }).catch(function () {
+      state.account.mode = 'accounts';
+      state.account.user = null;
+    }).then(function () {
+      state.account.status = 'ready';
+      render();
+      return isLoggedIn() && state.account.mode === 'accounts' ? pullProgress() : undefined;
+    });
+  }
+
+  /* ---------------- 进度云端同步 ----------------
+     localStorage 始终是主存储，服务器只是一份「换设备时用来找回进度」的快照。
+     所有持久化写入都经过 Store.set，所以防抖挂在它上面，不必逐个改动画点。
+     冲突策略是最简单的整份覆盖：谁的 savedAt 新，谁说了算。 */
+  var PROGRESS_KEYS = ['examDate', 'mistakes', 'stats', 'cards', 'kp', 'plan', 'days', 'session', 'feynman'];
+  var PROGRESS_DEFAULTS = {
+    examDate: null, mistakes: {}, stats: {}, cards: {}, kp: {},
+    plan: {}, days: [], session: null, feynman: {}
+  };
+  var sync = { status: 'idle', at: null, message: null, dirty: false, flying: false };
+
+  function progressSnapshot() {
+    var out = { v: 1, savedAt: Date.now() };
+    PROGRESS_KEYS.forEach(function (k) { out[k] = state[k]; });
+    return out;
+  }
+
+  function applyProgress(data) {
+    if (!data || typeof data !== 'object') return;
+    PROGRESS_KEYS.forEach(function (k) {
+      if (!Object.prototype.hasOwnProperty.call(data, k)) return;
+      var v = data[k];
+      if (v === undefined) v = null;
+      state[k] = (v === null && PROGRESS_DEFAULTS[k] !== null)
+        ? JSON.parse(JSON.stringify(PROGRESS_DEFAULTS[k])) : v;
+      Store.setQuiet(k, state[k]);
+    });
+    // 恢复出来的可能是一组已做完的题，跟启动时一样让它直接显示成绩页。
+    showingResult = !!(state.session && state.session.finished);
+  }
+
+  function paintSync() {
+    ['accSync', 'footSync'].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el) el.textContent = syncText();
+    });
+  }
+
+  function syncText() {
+    if (!isLoggedIn() || state.account.mode !== 'accounts') return '进度只存在这台设备上';
+    if (sync.status === 'saving') return '正在同步进度…';
+    if (sync.status === 'error') return '进度同步失败：' + (sync.message || '');
+    if (sync.at) return '进度已同步到服务器 · ' + sync.at.replace('T', ' ').slice(0, 16);
+    return '进度已在这台设备保存，稍后同步到服务器';
+  }
+
+  function scheduleSync(delay) {
+    if (!isLoggedIn() || state.account.mode !== 'accounts') return;
+    sync.dirty = true;
+    clearTimeout(sync.timer);
+    sync.timer = setTimeout(flushSync, delay === undefined ? 3000 : delay);
+  }
+
+  function flushSync() {
+    if (!isLoggedIn() || state.account.mode !== 'accounts') return;
+    if (sync.flying) return;               // 落地后若又有改动会再排一次
+    sync.flying = true;
+    sync.dirty = false;
+    sync.status = 'saving';
+    paintSync();
+    var payload = progressSnapshot();
+    window.Cloud.saveProgress(payload).then(function (res) {
+      sync.flying = false;
+      sync.at = (res && res.updated_at) || new Date(payload.savedAt).toISOString();
+      sync.status = 'saved';
+      sync.message = null;
+      Store.setQuiet('savedAt', payload.savedAt);
+      paintSync();
+      if (sync.dirty) scheduleSync(0);      // 上传期间又改过，补一次
+    }, function (e) {
+      sync.flying = false;
+      sync.status = 'error';
+      sync.message = e && e.message ? e.message : '无法连接服务器';
+      paintSync();
+      scheduleSync(30000);                 // 服务器不可用时退避，别一直敲
+    });
+  }
+
+  // 登录后先取回服务器上的快照：远端更新就覆盖本地，本地更新就推上去。
+  function pullProgress() {
+    return window.Cloud.loadProgress().then(function (res) {
+      var remote = res && res.data ? res.data : null;
+      var localAt = Number(Store.get('savedAt', 0)) || 0;
+      if (!remote) { scheduleSync(0); return; }
+      var remoteAt = Number(remote.savedAt) || 0;
+      if (remoteAt > localAt) {
+        applyProgress(remote);
+        Store.setQuiet('savedAt', remoteAt);
+        sync.at = res.updated_at || null;
+        sync.status = 'saved';
+        render();
+      } else {
+        scheduleSync(0);
+      }
+    }, function () {
+      // 取不回来就当纯本地用，不值得为这个打扰用户。
+    });
+  }
+
+  function flushSyncNow() {
+    if (!isLoggedIn() || state.account.mode !== 'accounts' || (!sync.dirty && !sync.flying)) return;
+    window.Cloud.saveProgressNow(progressSnapshot());
+  }
+
   function allQuestions() {
     var out = [];
     SUBJ_ORDER.forEach(function (s) {
@@ -327,7 +478,8 @@
     book: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4.5A1.5 1.5 0 0 1 5.5 3H19v14H5.5A1.5 1.5 0 0 0 4 18.5z"/><path d="M4 18.5A1.5 1.5 0 0 1 5.5 17H19v4H5.5A1.5 1.5 0 0 1 4 19.5z"/></svg>',
     flask: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3v6.5L5 18a2 2 0 0 0 1.8 3h10.4A2 2 0 0 0 19 18l-4-8.5V3"/><path d="M8 3h8M7 15h10"/></svg>',
     feynman: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5.5A1.5 1.5 0 0 1 5.5 4h13A1.5 1.5 0 0 1 20 5.5v8a1.5 1.5 0 0 1-1.5 1.5H10l-4.5 4v-4H5.5A1.5 1.5 0 0 1 4 13.5z"/><path d="M12 7.2a2.3 2.3 0 0 0-1.3 4.2v.9h2.6v-.9A2.3 2.3 0 0 0 12 7.2z"/></svg>',
-    admin: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2.1"/><circle cx="7" cy="17" r="2.1"/></svg>'
+    admin: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2.1"/><circle cx="7" cy="17" r="2.1"/></svg>',
+    account: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8.5" r="3.6"/><path d="M4.8 20a7.2 7.2 0 0 1 14.4 0"/></svg>'
   };
 
   /* ---------------- 数据聚合 ---------------- */
@@ -385,8 +537,17 @@
     { id: 'feynman', name: '费曼讲解', ico: 'feynman' },
     { id: 'syllabus', name: '考纲考点', ico: 'syllabus' },
     { id: 'plan', name: '复习计划', ico: 'plan' },
-    { id: 'admin', name: '内容管理', ico: 'admin' }
+    { id: 'admin', name: '内容管理', ico: 'admin', adminOnly: true },
+    // 账号页不进导航，由侧栏底部的账号卡片和「需要登录」的提示进入。
+    { id: 'account', name: '账号', ico: 'account', hidden: true }
   ];
+
+  function visibleRoutes() {
+    return ROUTES.filter(function (r) {
+      if (r.hidden) return false;
+      return !r.adminOnly || canSeeAdmin();
+    });
+  }
 
   function renderNav() {
     var badge = {};
@@ -396,7 +557,8 @@
     SUBJ_ORDER.forEach(function (s) { due += dueCards(s).length; });
     if (due) badge.cards = due;
 
-    var html = ROUTES.map(function (r) {
+    var routes = visibleRoutes();
+    var html = routes.map(function (r) {
       var cur = state.route === r.id;
       return '<li><a href="#/' + r.id + '"' + (cur ? ' aria-current="page"' : '') + '>' +
         ICO[r.ico] + '<span>' + r.name + '</span>' +
@@ -407,6 +569,38 @@
     var t = ROUTES.filter(function (r) { return r.id === state.route; })[0];
     document.getElementById('topbarTitle').textContent = t ? t.name : '';
     document.getElementById('streakNum').textContent = streak();
+    renderAccountWidget();
+  }
+
+  // 侧栏底部这一块是登录入口的主位：没登录时只说清「进度只在本机」，
+  // 不做拦路的弹窗；登录后换成账号、角色和同步状态。
+  function renderAccountWidget() {
+    var box = document.getElementById('footAccount');
+    if (!box) return;
+    if (state.account.status !== 'ready') {
+      box.innerHTML = '<p class="foot-note">学习进度保存在本机浏览器。</p>';
+      return;
+    }
+    // Qoder 站点没有本站账号，身份由平台网关给，这里不摆登录入口。
+    if (state.account.mode === 'gateway') {
+      box.innerHTML = '<p class="foot-note">学习进度保存在本机浏览器；管理身份随你登录的 Qoder 账号。</p>';
+      return;
+    }
+    if (!isLoggedIn()) {
+      box.innerHTML = '<p class="foot-note" id="footSync">进度只存在这台设备上</p>' +
+        // 侧栏在 #view 外面，收不到委托的点击事件，所以这里用普通链接而不是 data-act 按钮。
+        '<a class="btn btn-sm btn-block" href="#/account">登录 / 注册</a>' +
+        '<p class="foot-note">登录后可跨设备同步进度。</p>';
+      return;
+    }
+    var u = state.account.user;
+    var role = isAdmin() ? '管理员' : '学习者';
+    box.innerHTML = '<a class="acc-chip" href="#/account">' +
+      '<span class="acc-avatar" aria-hidden="true">' + esc(String(u.name || u.username || '?').slice(0, 1)) + '</span>' +
+      '<span class="acc-meta"><b>' + esc(u.name || u.username) + '</b>' +
+      '<span class="acc-role">' + role + '</span></span>' +
+      '<span class="acc-go" aria-hidden="true">›</span></a>' +
+      '<p class="foot-note" id="footSync">' + esc(syncText()) + '</p>';
   }
 
   function renderCountdown() {
@@ -770,7 +964,15 @@
       (wrong ? '<button class="btn" data-act="review-wrong">重做本次错题（' + wrong + '）</button>' : '') +
       '<button class="btn btn-ghost" data-act="go-mistakes">打开错题本</button>' +
       '<button class="btn btn-ghost" data-act="go-home">返回总览</button>' +
-      '</div></div>';
+      '</div>' + loginHint() + '</div>';
+  }
+
+  // 一组题刚做完，是「进度只在本机」最有体感的时刻；提示放这里，不在进站时拦人。
+  function loginHint() {
+    if (state.account.mode !== 'accounts' || isLoggedIn()) return '';
+    return '<p class="sync-hint">' + ICO.account +
+      '<span>这组成绩目前只存在这台设备的浏览器里。' +
+      '<a href="#/account">登录或注册</a>之后会自动同步到服务器，换设备也能接着做。</span></p>';
   }
 
   /* ---------------- 视图：错题本 ---------------- */
@@ -1264,7 +1466,7 @@
         '<span class="miss-badge">' + (r.r === 'stuck' ? '讲不出' : '有点卡') + '</span>' +
         '<div class="q-item-actions">' +
         '<button class="btn btn-sm" data-act="fey-redo" data-k="' + esc(r.key) + '">现在重讲</button>' +
-        (state.owner.status === 'owner'
+        (canWriteContent()
           ? '<button class="btn btn-sm" data-act="fey-tocard" data-k="' + esc(r.key) + '">存为背诵卡</button>' : '') +
         '</div></div>' +
         '<div class="q-item-stem">' + rich(item.prompt) + '</div>' +
@@ -1293,8 +1495,10 @@
       '</div></div>' +
       (items ? '<div class="card" style="margin-top:16px"><div class="card-head"><h2>卡壳清单</h2>' +
         '<span class="hint">' + stuck.length + ' 项</span></div><div class="q-list">' + items + '</div></div>' : '') +
-      (state.owner.status === 'owner' ? ''
-        : '<p class="fey-note" style="margin-top:14px">在「内容管理」里启用后台管理后，卡壳点可以一键存成你自己的背诵卡，下次直接复习。</p>') +
+      // 「还能怎么拿到权限」这类信息只该给 Qoder 站点的所有者看；
+      // 自建部署下没有管理权限的人，连这个按钮的存在都不必知道。
+      (state.account.mode === 'gateway' && !canWriteContent()
+        ? '<p class="fey-note" style="margin-top:14px">在「内容管理」里启用后台管理后，卡壳点可以一键存成你自己的背诵卡，下次直接复习。</p>' : '') +
       '</div>';
   }
 
@@ -1399,7 +1603,7 @@
     if (!host) return;
     var a = state.admin;
     var rows = admRows(a.tab, a.subject, a.q);
-    var canWrite = state.owner.status === 'owner';
+    var canWrite = canWriteContent();
     var shown = rows.slice(0, ADM_LIST_CAP);
     var body;
 
@@ -1565,13 +1769,74 @@
       '</div></div>';
   }
 
+  // 管理员直接看到工具条；「启用后台管理」那一步只有 Qoder 站点（gateway）才需要。
+  function adminTools() {
+    var a = state.admin;
+    return '<div class="row wrap" style="gap:8px">' +
+      '<button class="btn btn-sm btn-primary" data-act="adm-sync"' + (a.busy ? ' disabled' : '') + '>' +
+      (a.busy ? '处理中…' : '把内置内容同步到云端') + '</button>' +
+      '<button class="btn btn-sm" data-act="adm-export">导出全部内容 JSON</button>' +
+      '<button class="btn btn-sm" data-act="adm-import"' + (a.busy ? ' disabled' : '') + '>导入 JSON</button>' +
+      '<button class="btn btn-sm btn-ghost" data-act="adm-reload">重新读取云端</button>' +
+      '<input type="file" id="admFile" accept="application/json,.json" hidden>' +
+      '</div>' +
+      '<p class="fey-note" style="margin-top:10px">同步只会补充云端还没有的编号，不会覆盖你后来改过的内容，可以重复执行。</p>';
+  }
+
+  function gatewayOwnerCard() {
+    var o = state.owner;
+    var a = state.admin;
+    if (o.status === 'loading') {
+      return '<p class="adm-state">正在确认管理权限…</p>';
+    }
+    if (o.status === 'error') {
+      return '<p class="adm-state is-bad">' + esc(o.message || '无法确认管理权限') + '</p>' +
+        '<button class="btn btn-sm" data-act="adm-reload">重试</button>';
+    }
+    if (o.status === 'anon') {
+      return '<p class="adm-state">修改题库需要先登录 Qoder 账号。请用站点所有者的账号打开本站，再回到这一页。</p>' +
+        '<button class="btn btn-sm" data-act="adm-reload">我已登录，重新检查</button>';
+    }
+    if (o.status === 'other') {
+      return '<p class="adm-state is-warn">后台管理已由另一个账号启用，当前账号只能浏览内容，不能修改。若需要换账号管理，请先由原所有者在云端清除所有者记录。</p>' +
+        '<button class="btn btn-sm" data-act="adm-reload">重新检查</button>';
+    }
+    if (o.status === 'unclaimed') {
+      return '<p class="adm-state">还没有启用后台管理。启用后，<b>只有当前登录的这个 Qoder 账号</b>能修改题库，其他访客即使打开这一页也只能浏览。</p>' +
+        '<div class="adm-warn"><b>启用前请确认</b><p>云端题库需要在数据库层开放匿名读写，靠本站点的「私有访问 + 服务端所有者校验」来兜住权限。' +
+        '站点一旦改为公开或邀请其他访客，这个前提就不再成立，需要重新评估。</p></div>' +
+        '<button class="btn btn-primary" data-act="adm-claim"' + (a.busy ? ' disabled' : '') + '>' +
+        (a.busy ? '启用中…' : '启用后台管理') + '</button>';
+    }
+    return '<p class="adm-state is-ok">后台管理已启用，当前账号可以修改题库。</p>' + adminTools();
+  }
+
+  // 自建部署下没有管理权限的人走到 #/admin：只说清「这里需要管理员账号」，
+  // 不暴露题库条数、同步状态这些管理信息。
+  function viewAdminLocked() {
+    var head = '<div class="page-head"><h1>内容管理</h1></div>';
+    var body;
+    if (state.account.status !== 'ready') {
+      body = '<p class="adm-state">正在确认登录身份…</p>';
+    } else if (!isLoggedIn()) {
+      body = '<p class="adm-state">这一页只对管理员开放。请用管理员账号登录后再访问。</p>' +
+        '<button class="btn btn-primary" data-act="nav" data-to="account">去登录</button>';
+    } else {
+      body = '<p class="adm-state is-warn">当前账号没有管理权限，看不到这一页的内容。</p>' +
+        '<p class="fey-note">需要修改题库、考纲或背诵卡，请让站点管理员把你的账号提升为管理员。</p>' +
+        '<button class="btn" data-act="nav" data-to="dashboard">返回总览</button>';
+    }
+    return head + '<div class="card">' + body + '</div>';
+  }
+
   function viewAdmin() {
     var a = state.admin;
     var n = contentCounts();
-    var o = state.owner;
+    var gateway = state.account.mode === 'gateway';
+    var canWrite = canWriteContent();
 
     var head = '<div class="page-head"><h1>内容管理</h1>' +
-      '<p class="sub">题库、考纲章节和背诵卡都存在云端，改动会同步到你所有设备上的这个站点。只有站点所有者能修改。</p></div>';
+      '<p class="sub">题库、考纲章节和背诵卡都存在云端，改动会同步到你所有设备上的这个站点。</p></div>';
 
     var sourceLine;
     if (state.cloud.status === 'loading') sourceLine = '<span class="adm-dot is-load"></span>正在读取云端题库…';
@@ -1583,43 +1848,16 @@
       sourceLine = '<span class="adm-dot is-bad"></span>云端题库读取失败，当前显示的是内置内容 —— ' + esc(state.cloud.message || '');
     }
 
-    var ownerCard;
-    if (o.status === 'loading') {
-      ownerCard = '<p class="adm-state">正在确认管理权限…</p>';
-    } else if (o.status === 'error') {
-      ownerCard = '<p class="adm-state is-bad">' + esc(o.message || '无法确认管理权限') + '</p>' +
-        '<button class="btn btn-sm" data-act="adm-reload">重试</button>';
-    } else if (o.status === 'anon') {
-      ownerCard = '<p class="adm-state">修改题库需要先登录 Qoder 账号。请用站点所有者的账号打开本站，再回到这一页。</p>' +
-        '<button class="btn btn-sm" data-act="adm-reload">我已登录，重新检查</button>';
-    } else if (o.status === 'other') {
-      ownerCard = '<p class="adm-state is-warn">后台管理已由另一个账号启用，当前账号只能浏览内容，不能修改。若需要换账号管理，请先由原所有者在云端清除所有者记录。</p>' +
-        '<button class="btn btn-sm" data-act="adm-reload">重新检查</button>';
-    } else if (o.status === 'unclaimed') {
-      ownerCard = '<p class="adm-state">还没有启用后台管理。启用后，<b>只有当前登录的这个 Qoder 账号</b>能修改题库，其他访客即使打开这一页也只能浏览。</p>' +
-        '<div class="adm-warn"><b>启用前请确认</b><p>云端题库需要在数据库层开放匿名读写，靠本站点的「私有访问 + 服务端所有者校验」来兜住权限。' +
-        '站点一旦改为公开或邀请其他访客，这个前提就不再成立，需要重新评估。</p></div>' +
-        '<button class="btn btn-primary" data-act="adm-claim"' + (a.busy ? ' disabled' : '') + '>' +
-        (a.busy ? '启用中…' : '启用后台管理') + '</button>';
-    } else {
-      ownerCard = '<p class="adm-state is-ok">后台管理已启用，当前账号可以修改题库。</p>' +
-        '<div class="row wrap" style="gap:8px">' +
-        '<button class="btn btn-sm btn-primary" data-act="adm-sync"' + (a.busy ? ' disabled' : '') + '>' +
-        (a.busy ? '处理中…' : '把内置内容同步到云端') + '</button>' +
-        '<button class="btn btn-sm" data-act="adm-export">导出全部内容 JSON</button>' +
-        '<button class="btn btn-sm" data-act="adm-import"' + (a.busy ? ' disabled' : '') + '>导入 JSON</button>' +
-        '<button class="btn btn-sm btn-ghost" data-act="adm-reload">重新读取云端</button>' +
-        '<input type="file" id="admFile" accept="application/json,.json" hidden>' +
-        '</div>' +
-        '<p class="fey-note" style="margin-top:10px">同步只会补充云端还没有的编号，不会覆盖你后来改过的内容，可以重复执行。</p>';
-    }
+    var manageCard = gateway ? gatewayOwnerCard()
+      : '<p class="adm-state is-ok">当前账号 <b>' + esc(state.account.user.name || state.account.user.username) +
+        '</b> 是管理员，可以直接修改内容。</p>' + adminTools();
 
     var msg = a.msg
       ? '<div class="adm-msg is-' + a.msg.kind + '">' + esc(a.msg.text) + '</div>'
       : '';
 
     // 有管理权限却还没把内置内容传上去：这时新建内容会让内置题目从界面上消失，必须先提醒。
-    if (o.status === 'owner' && state.cloud.status === 'empty') {
+    if (canWrite && state.cloud.status === 'empty') {
       msg = '<div class="adm-msg is-err">云端题库还是空的。请先点上面的「把内置内容同步到云端」，再开始新建或导入内容。' +
         '云端一旦有了题目就会成为唯一数据源，空云端里只加几条，会让随站点打包的内置题目在界面上全部消失。</div>' + msg;
     }
@@ -1636,7 +1874,6 @@
         esc(x.name) + '</button>';
     }).join('');
 
-    var canWrite = o.status === 'owner';
     var toolbar = '<div class="card-head"><h2>' +
       (a.tab === 'questions' ? '题目' : a.tab === 'chapters' ? '考纲章节' : '背诵卡') +
       '<span class="hint" id="admCount" style="margin-left:8px"></span></h2>' +
@@ -1657,12 +1894,12 @@
       '<div class="dn"><b>' + n.cards + '</b><span>背诵卡</span></div>' +
       '</div></div>' +
       '<div class="card" style="margin-bottom:16px"><div class="card-head"><h2>管理权限</h2></div>' +
-      ownerCard + '</div>' +
+      manageCard + '</div>' +
       msg +
       (canWrite ? admEditor() : '') +
       '<div class="card">' + tabs + toolbar +
       (canWrite ? '' : '<p class="fey-note" style="margin-bottom:12px">' +
-        (o.status === 'other' ? '当前账号只能浏览，不能修改内容。' : '启用后台管理后可以新建、编辑和删除内容。') + '</p>') +
+        (state.owner.status === 'other' ? '当前账号只能浏览，不能修改内容。' : '启用后台管理后可以新建、编辑和删除内容。') + '</p>') +
       '<div class="adm-list" id="adminList"></div>' +
       '</div>';
   }
@@ -1941,7 +2178,10 @@
     state.admin.busy = true;
     admMsg('info', '正在重新读取云端…');
     render();
-    Promise.all([loadCloud(), loadOwner()]).then(function () {
+    // accounts 模式下能打开这一页就说明权限已经确认过，不必再拉一次身份，
+    // 也避免顺手触发一次进度回灌把本地改动盖掉。
+    var identity = state.account.mode === 'gateway' ? loadOwner() : Promise.resolve();
+    Promise.all([loadCloud(), identity]).then(function () {
       state.admin.busy = false;
       var n = contentCounts();
       var summary = '题目 ' + n.questions + '、章节 ' + n.chapters + '、背诵卡 ' + n.cards + '。';
@@ -2040,6 +2280,174 @@
     step(0);
   }
 
+  /* ---------------- 视图：账号 ----------------
+     登录不是进站门槛，而是「想把进度带到别的设备上」时才需要的一步。 */
+  function viewAccount() {
+    var head = '<div class="page-head"><h1>账号</h1>' +
+      '<p class="sub">浏览内容和做题都不需要登录。登录只为一件事：把学习进度备一份到服务器，换设备时能找回来。</p></div>';
+    if (state.account.mode === 'gateway') return head + gatewayAccountCard();
+    if (state.account.status !== 'ready') {
+      return head + '<div class="card acc-card"><p class="adm-state">正在确认登录状态…</p></div>';
+    }
+    return head + (isLoggedIn() ? accountCard() : authCard());
+  }
+
+  function gatewayAccountCard() {
+    var o = state.owner;
+    var text = o.status === 'owner' ? '当前 Qoder 账号是本站点所有者，可以修改题库内容。'
+      : o.status === 'unclaimed' ? '当前 Qoder 账号还没有启用后台管理，去「内容管理」里可以启用。'
+        : o.status === 'other' ? '后台管理已由另一个 Qoder 账号启用，当前账号只能浏览内容。'
+          : o.status === 'anon' ? '还没有登录 Qoder 账号。'
+            : o.status === 'error' ? (o.message || '无法读取管理权限') : '正在确认登录状态…';
+    return '<div class="card acc-card">' +
+      '<p class="adm-state">' + esc(text) + '</p>' +
+      '<p class="fey-note">这个站点托管在 Qoder Sites 上，身份由平台统一提供，没有本站自己的登录页；' +
+      '学习进度只保存在这台设备的浏览器里，不会同步到别处。</p>' +
+      '</div>';
+  }
+
+  function authCard() {
+    var a = state.account;
+    var reg = a.form === 'register';
+    var label = reg ? '注册并登录' : '登录';
+    var msg = a.msg
+      ? '<div class="acc-msg is-' + a.msg.kind + '" id="accMsg">' + esc(a.msg.text) + '</div>'
+      : '<div class="acc-msg" id="accMsg" hidden></div>';
+    return '<div class="card acc-card">' +
+      '<div class="chip-row" style="margin-bottom:14px">' +
+      '<button class="chip" data-act="acc-tab" data-v="login" aria-pressed="' + !reg + '">登录</button>' +
+      '<button class="chip" data-act="acc-tab" data-v="register" aria-pressed="' + reg + '">注册新账号</button>' +
+      '</div>' + msg +
+      '<form id="accForm">' +
+      '<label class="acc-field"><span>用户名</span>' +
+      '<input type="text" name="username" autocomplete="username" required minlength="3" maxlength="32" ' +
+      'pattern="[A-Za-z0-9_.\\-]{3,32}" placeholder="3–32 位字母、数字或 . _ -" ' +
+      'title="3–32 位字母、数字、点、下划线或短横线">' +
+      '<small>不区分大小写，存进数据库时会统一转成小写。</small></label>' +
+      (reg ? '<label class="acc-field"><span>昵称（可选）</span>' +
+        '<input type="text" name="displayName" maxlength="40" autocomplete="nickname" placeholder="留空就用用户名"></label>' : '') +
+      '<label class="acc-field"><span>口令</span>' +
+      '<input type="password" name="password" minlength="8" maxlength="128" required ' +
+      'autocomplete="' + (reg ? 'new-password' : 'current-password') + '" placeholder="至少 8 位"></label>' +
+      (reg ? '<label class="acc-field"><span>再输一次口令</span>' +
+        '<input type="password" name="password2" minlength="8" maxlength="128" required ' +
+        'autocomplete="new-password" placeholder="和上面保持一致"></label>' : '') +
+      '<button class="btn btn-primary btn-block" type="submit" id="accSubmit" data-label="' + label + '"' +
+      (a.busy ? ' disabled' : '') + '>' + (a.busy ? '处理中…' : label) + '</button>' +
+      '</form>' +
+      '<p class="fey-note" style="margin-top:12px">' +
+      (reg ? '注册是开放的，任何人都能建账号；只有管理员账号能看到「内容管理」并修改题库。'
+        : '还没有账号就切到「注册新账号」，注册完直接就是登录状态。') + '</p>' +
+      '</div>';
+  }
+
+  function accountCard() {
+    var u = state.account.user;
+    var admin = isAdmin();
+    return '<div class="card acc-card">' +
+      '<div class="acc-id">' +
+      '<span class="acc-avatar acc-avatar-lg" aria-hidden="true">' + esc(String(u.name || u.username).slice(0, 1)) + '</span>' +
+      '<div class="acc-idtext"><b>' + esc(u.name || u.username) + '</b>' +
+      '<p class="acc-sub">用户名 ' + esc(u.username) + ' · ' + (admin ? '管理员' : '学习者') + '</p></div>' +
+      '</div>' +
+      '<div class="acc-sync"><span class="adm-dot ' + (sync.status === 'error' ? 'is-bad' : 'is-ok') + '"></span>' +
+      '<span id="accSync">' + esc(syncText()) + '</span></div>' +
+      '<p class="fey-note">进度以这台设备上的浏览器存储为准，登录后每次改动会在几秒内备一份到服务器。' +
+      '换设备登录时，服务器那份比本地新就用服务器的覆盖本地。</p>' +
+      '<div class="row wrap" style="gap:8px;margin-top:14px">' +
+      '<button class="btn btn-sm" data-act="acc-sync-now">立即同步</button>' +
+      '<button class="btn btn-sm" data-act="acc-pull">从服务器恢复</button>' +
+      '<div style="flex:1"></div>' +
+      '<button class="btn btn-sm btn-ghost" data-act="acc-logout"' + (state.account.busy ? ' disabled' : '') + '>退出登录</button>' +
+      '</div>' +
+      (admin ? '<p class="fey-note" style="margin-top:12px">你是管理员，导航里有「内容管理」，可以改题库、考纲和背诵卡。</p>' : '') +
+      '</div>';
+  }
+
+  function accSetMsg(kind, text) {
+    state.account.msg = kind ? { kind: kind, text: text } : null;
+    var box = document.getElementById('accMsg');
+    // 报错时只改那一行，不整页重绘，免得把用户刚填的内容冲掉。
+    if (!box) { render(); return; }
+    box.className = 'acc-msg' + (kind ? ' is-' + kind : '');
+    box.textContent = text || '';
+    box.hidden = !kind;
+  }
+
+  function accBusy(on) {
+    state.account.busy = on;
+    var btn = document.getElementById('accSubmit');
+    if (!btn) return;
+    btn.disabled = on;
+    btn.textContent = on ? '处理中…' : btn.getAttribute('data-label');
+  }
+
+  function accSubmit() {
+    if (state.account.busy) return;
+    var form = document.getElementById('accForm');
+    if (!form) return;
+    var reg = state.account.form === 'register';
+    var f = form.elements;
+    var username = String(f.username.value || '').trim();
+    var password = String(f.password.value || '');
+    if (reg && password !== String(f.password2.value || '')) {
+      accSetMsg('err', '两次输入的口令不一致。');
+      return;
+    }
+    accSetMsg(null);
+    accBusy(true);
+    var req = reg
+      ? window.Cloud.register(username, password, String(f.displayName.value || '').trim())
+      : window.Cloud.login(username, password);
+    req.then(function (res) {
+      state.account.user = (res && res.user) || null;
+      accBusy(false);
+      sync.status = 'idle'; sync.at = null; sync.message = null;
+      toast(reg ? '账号已创建，进度会开始同步' : '已登录');
+      render();
+      return pullProgress();
+    }, function (e) {
+      accBusy(false);
+      accSetMsg('err', e && e.message ? e.message : '操作失败，请稍后重试');
+    });
+  }
+
+  function accLogout() {
+    if (state.account.busy) return;
+    flushSyncNow();                          // 退出前把最后一份快照丢出去
+    state.account.busy = true;
+    window.Cloud.logout().then(function () {
+      state.account.user = null;
+      state.account.busy = false;
+      sync.status = 'idle'; sync.at = null; sync.dirty = false; sync.message = null;
+      clearTimeout(sync.timer);
+      toast('已退出登录，进度仍留在这台设备上');
+      // 退出后「内容管理」就不该再停着了。
+      if (state.route === 'admin') navigate('dashboard'); else render();
+    }, function (e) {
+      state.account.busy = false;
+      accSetMsg('err', e && e.message ? e.message : '退出失败，请刷新页面重试');
+    });
+  }
+
+  function accPull() {
+    openModal('用服务器上的进度覆盖本机？',
+      '本机的做题记录、错题本、背诵卡进度和复习计划都会被服务器那份替换，此操作不可撤销。',
+      '', '覆盖本机', function () {
+        window.Cloud.loadProgress().then(function (res) {
+          if (!res || !res.data) { toast('服务器上还没有这个账号的进度'); return; }
+          applyProgress(res.data);
+          Store.setQuiet('savedAt', Number(res.data.savedAt) || 0);
+          sync.at = res.updated_at || null;
+          sync.status = 'saved';
+          render();
+          toast('已恢复服务器上的进度');
+        }, function (e) {
+          toast(e && e.message ? e.message : '读取失败，请稍后重试');
+        });
+      });
+  }
+
   /* ---------------- 路由 ---------------- */
   function routeFromHash() {
     var h = (location.hash || '').replace(/^#\/?/, '');
@@ -2060,7 +2468,10 @@
         case 'feynman': html = viewFeynman(); break;
         case 'syllabus': html = viewSyllabus(); break;
         case 'plan': html = viewPlan(); break;
-        case 'admin': html = viewAdmin(); break;
+        case 'account': html = viewAccount(); break;
+        // 手输 #/admin 进来的非管理员看锁定页，而不是被弹回总览：
+        // 身份还在确认时弹跳会让真正的管理员也闪一下。
+        case 'admin': html = canSeeAdmin() ? viewAdmin() : viewAdminLocked(); break;
         default: html = viewDashboard();
       }
     }
@@ -2433,6 +2844,23 @@
       }
       case 'fey-tocard': saveStuckCard(el.getAttribute('data-k'), el); break;
 
+      /* ---- 账号 ---- */
+      case 'acc-tab': {
+        if (state.account.busy) break;
+        state.account.form = el.getAttribute('data-v') === 'register' ? 'register' : 'login';
+        state.account.msg = null;
+        render();
+        break;
+      }
+      case 'acc-sync-now': {
+        clearTimeout(sync.timer);
+        sync.dirty = true;
+        flushSync();
+        break;
+      }
+      case 'acc-pull': accPull(); break;
+      case 'acc-logout': accLogout(); break;
+
       /* ---- 内容管理 ---- */
       case 'adm-tab': {
         state.admin.tab = el.getAttribute('data-v');
@@ -2663,12 +3091,18 @@
   document.addEventListener('change', onChange);
   document.addEventListener('input', onInput);
   document.addEventListener('keydown', onKeydown);
+  // 用真正的 <form> 提交，回车就能登录；这里只拦掉默认跳转。
+  document.addEventListener('submit', function (e) {
+    if (e.target && e.target.id === 'accForm') { e.preventDefault(); accSubmit(); }
+  });
   window.addEventListener('hashchange', function () {
     state.route = routeFromHash();
     if (state.route !== 'practice') showingResult = false;
     render();
     window.scrollTo(0, 0);
   });
+  // 关页面时防抖还没到点，那份改动就丢了；这里补一枪。
+  window.addEventListener('pagehide', flushSyncNow);
 
   state.route = routeFromHash();
   showingResult = !!(state.session && state.session.finished);
@@ -2678,5 +3112,5 @@
   migrateKp();
   render();
   loadCloud().then(render, render);
-  loadOwner().then(render, render);
+  loadIdentity();
 })();

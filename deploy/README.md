@@ -3,7 +3,7 @@
 把「药大生医 · 初试复习台」从 Qoder Sites 搬到你自己租的服务器上。搬完之后以服务器为准，
 Qoder 站点保留但不再更新，作为回退备份。
 
-迁移范围：前端页面 + 题库后台接口 + 数据库结构 + 现有内容（353 题 / 32 章 / 89 卡）。
+迁移范围：前端页面 + 题库后台接口 + 站内账号体系 + 数据库结构 + 现有内容（353 题 / 32 章 / 89 卡）。
 
 > **两条部署路线，先选一条：**
 >
@@ -22,16 +22,19 @@ Qoder 站点保留但不再更新，作为回退备份。
 | | Qoder Sites（现在） | 你的服务器（迁移后） |
 | --- | --- | --- |
 | 前端 | 平台托管的静态文件 | nginx 反代 → Node 直接托管 `web/` |
-| 题库接口 | Deno Function，路径 `/functions/v1/app` | Node 服务，**路径不变**，所以前端一行没改 |
-| 登录方式 | Qoder 账号，由平台网关判定身份 | HTTP Basic 口令，打开站点时浏览器弹窗输入一次 |
+| 题库接口 | Deno Function，路径 `/functions/v1/app` | Node 服务，**路径和 action 名都不变**，前端不用为迁移改任何东西 |
+| 登录方式 | Qoder 账号，由平台网关判定身份 | 站内账号：`.env` 里的管理员 + 开放注册的普通用户，登录页在 `#/account` |
 | 数据库 | 平台托管的 PostgreSQL（`app` schema） | 你自己的 PostgreSQL（`public` schema），容器或系统服务均可 |
-| 访问控制 | 站点设为私有，只有受邀者能进 | 整站（含静态文件）都在口令之后 |
-| 学习进度 | 存在浏览器 localStorage，绑定 qoder.website 域名 | 存在浏览器 localStorage，绑定你的新域名 |
+| 访问控制 | 站点设为私有，只有受邀者能进 | 页面和题库**公开可读**；只有「同步进度」「改内容」需要登录 |
+| 学习进度 | 存在浏览器 localStorage，绑定 qoder.website 域名 | localStorage 为主，登录后再往服务器备一份快照，可跨设备找回 |
 
-**进度数据不会自己跟过来**——它绑域名。搬迁办法见第 7 节。
+**登录不是进站门槛。** 浏览、刷题、背卡片全都不需要账号；只有在「想把进度带到别的设备」
+或「要改题库内容」时才需要登录。登录之后进度会自动同步到服务器，换设备登录同一个账号就能接着做。
+旧的 Qoder 进度**不会自己跟过来**（它绑域名），一次性搬迁办法见第 7 节。
 
 `functions/` 目录是 Qoder 那一侧的实现，迁移后冻结不再维护；服务器这一侧的实现在 `deploy/server/`。
-两边的字段校验规则目前是一致的，但从此各改各的。
+两边对外的 action 名和错误码仍然一致（所以前端一行没改），但**账号体系是服务器独有的**：
+Qoder 侧没有 `app_users`，身份由平台网关给。字段校验规则目前也一致，从此各改各的。
 
 ---
 
@@ -40,7 +43,7 @@ Qoder 站点保留但不再更新，作为回退备份。
 ```
 deploy/
 ├── docker-compose.yml      【Docker 路线】nginx + api + postgres 三个服务
-├── schema.sql              建表语句，两条路线共用
+├── schema.sql              建表语句（题库 / 考纲 / 背诵卡 / 账号 / 进度），两条路线共用
 ├── .env.example            口令模板，复制成 .env 后填写，两条路线共用
 ├── nginx/site.conf         【Docker 路线】反向代理配置，含 HTTPS 段落（默认注释）
 ├── native/                 【原生路线】不用 Docker 的安装套件
@@ -140,7 +143,8 @@ curl -s -o /dev/null -w 'npmmirror %{http_code}\n' --max-time 15 https://registr
 **安装脚本会做这些事**：从 npmmirror 下载 Node 20 官方二进制（带 sha256 校验）→
 用发行版 PostgreSQL 建库建表 → 把 `web/` 和 `deploy/` 复制到 `/opt/cpubiomed` →
 `npm install` 装 `pg` → 写 systemd 服务（专用低权限用户、只读运行、开机自启）→
-装 nginx 反代并开 gzip → 自检并打印题库条数。
+装 nginx 反代并开 gzip → 自检（首页公开可读、未登录访问进度接口返回 401、管理员账号已落库、
+题库条数）并打印结果。
 
 ```bash
 # 1. 上传代码（在你自己电脑上执行）
@@ -150,6 +154,7 @@ scp -r web deploy <user>@<ip>:~/cpubiomed/
 cd ~/cpubiomed
 cp deploy/.env.example deploy/.env && chmod 600 deploy/.env
 openssl rand -hex 24    # 跑两次，分别填 ADMIN_PASSWORD 和 POSTGRES_PASSWORD
+                        # 想固定会话密钥就再跑一次 openssl rand -hex 32 填 SESSION_SECRET，否则留空
 nano deploy/.env
 
 # 3. 一键安装
@@ -162,7 +167,10 @@ sudo bash deploy/native/install.sh
 **几个要知道的点**：
 
 - **幂等**：`install.sh` 可以重复执行，也是日后的更新方式。它只替换 `/opt/cpubiomed`
-  下的代码，**不动数据库**——你在后台加的题、改过的内容都还在。
+  下的代码，**不动已有数据**——你在后台加的题、改过的内容都还在。每次都会重跑一遍
+  `schema.sql`，全是 `IF NOT EXISTS`，所以新版本加的表（`app_users`、`user_progress`）
+  会自动补上。Docker 路线不一样：`schema.sql` 只在数据卷**第一次**初始化时执行，
+  升级后要手动补一次，见第 9 节。
 - **口令落盘位置**：`deploy/.env` 只在安装时用一次。脚本会生成
   `/etc/cpubiomed/cpubiomed.env`（权限 600，仅 root 可读）给 systemd 用，
   并**删掉复制进 `/opt` 的那份 `.env`**。
@@ -208,12 +216,20 @@ openssl rand -hex 24   # 给 POSTGRES_PASSWORD
 nano .env
 ```
 
-`.env` 里四个值：
+`.env` 里的值：
 
-- `ADMIN_USER` / `ADMIN_PASSWORD` —— 打开网站时浏览器弹窗要填的账号口令。
-  整站（页面和题库接口）都在这个口令后面。**口令至少 8 位**，否则服务会拒绝启动。
+- `ADMIN_USER` / `ADMIN_PASSWORD` —— **管理员账号**，服务启动时会自动同步进 `app_users`
+  表（`role = admin`）。用这个账号登录后，导航里会自动出现「内容管理」；普通用户看不到那一项。
+  改这里的口令再重启就会重新同步，不会把自己锁在门外。**口令至少 8 位**，否则服务拒绝启动。
+- `SESSION_SECRET`（可选）—— 会话 Cookie 的签名密钥，**至少 32 位字母数字**，
+  用 `openssl rand -hex 32` 生成。**留空就自动从 `ADMIN_PASSWORD` 派生**，日常可以不管；
+  代价是日后改管理员口令会让所有人重新登录一次。填了它，改口令就不影响已登录的会话。
 - `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` —— 数据库口令，只在容器内网用，你不会直接碰。
 - `HTTP_PORT` —— 对外端口，默认 80。
+
+普通用户不需要你建账号：站点上的注册是开放的（`#/account` 页），注册进来就是 `role = user`，
+只能同步自己的学习进度，碰不到题库内容。要把某人提成管理员，在数据库里改 `app_users.role`
+（见第 9 节）。
 
 口令请用 `openssl rand -hex 24` 生成，**不要用 `base64`**：base64 会带出 `+` `/` `=`，
 拼进 `DATABASE_URL` 连接串时会被解析错，表现为数据库连不上。
@@ -245,25 +261,39 @@ sudo systemctl restart cpubiomed                 # 改了 deploy/server/ 下的�
 
 ### 验证清单
 
-打开 `http://<服务器IP>/`，浏览器弹出登录框，填 `.env` 里的 `ADMIN_USER` / `ADMIN_PASSWORD`：
+打开 `http://<服务器IP>/`。**不该弹任何登录框**，页面直接就出来了：
 
 - [ ] 首页正常显示，侧边栏四个科目都在
+- [ ] 左下角写着「进度只存在这台设备上」和一个「登录 / 注册」按钮
 - [ ] 「刷题训练」里生物化学 64 题、分析化学 132 题，章节筛选能看到「2025 年真题」等
 - [ ] 「背诵卡」角标显示 89
-- [ ] 「考纲速查」「复习计划」「费曼讲解」都能打开
-- [ ] 「内容管理」→ 点「启用后台管理」→ 提示已启用（这一步把所有者身份写进新库）
-- [ ] 在后台新增一道测试题 → 刷新页面 → 题还在
-- [ ] 删掉那道测试题
-- [ ] 退出登录（关掉所有该站点标签页再打开，或清一次站点数据）→ 会重新弹登录框
+- [ ] 「考纲速查」「复习计划」「费曼讲解」都能打开，全程没要求登录
+- [ ] 导航里**没有**「内容管理」（还没登录）
+- [ ] 随便做一组题 → 交卷后的成绩页底部出现「这组成绩目前只存在这台设备的浏览器里」的提示
+- [ ] 点左下角「登录 / 注册」→ 用 `.env` 里的 `ADMIN_USER` / `ADMIN_PASSWORD` 登录
+- [ ] 登录后左下角变成头像 + 用户名 + 「管理员」，导航里**自动多出「内容管理」**
+- [ ] 「内容管理」直接就是编辑界面（自建部署不需要「启用后台管理」那一步，那是 Qoder 站点才有的）
+- [ ] 在后台新增一道测试题 → 刷新页面 → 题还在 → 删掉它
+- [ ] 登录状态下做完一组题，等几秒（改动有 3 秒防抖），左下角从「正在同步进度…」
+      变成「进度已同步到服务器 · 时间」
+- [ ] 「账号」页 → 点「从服务器恢复」→ 进度对得上
+- [ ] 「账号」页 → 「退出登录」→ 导航里的「内容管理」消失；手输 `#/admin` 只看到
+      「这一页只对管理员开放」，看不到题库条数、同步按钮这些管理信息
+- [ ] 再注册一个新账号（开放注册）→ 登录后导航里同样**没有**「内容管理」；
+      手输 `#/admin` 看到「当前账号没有管理权限」，同样没有任何管理数据
 - [ ] 直接访问 `http://<服务器IP>:8080/` 应该连不上（接口没暴露到公网）
 
 命令行侧的检查：
 
 ```bash
-curl -s -o /dev/null -w '%{http_code}\n' http://localhost/          # 401（没带口令）
-curl -s -o /dev/null -w '%{http_code}\n' -u "$ADMIN_USER:$ADMIN_PASSWORD" http://localhost/   # 200
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost/          # 200（页面公开可读）
+curl -s -o /dev/null -w '%{http_code}\n' 'http://localhost/functions/v1/app?action=bank'   # 200
+curl -s -o /dev/null -w '%{http_code}\n' 'http://localhost/functions/v1/app?action=progress'  # 401（没登录）
 curl -s -u "$ADMIN_USER:$ADMIN_PASSWORD" 'http://localhost/functions/v1/app?action=bank' | head -c 200
 ```
+
+最后一条是给脚本用的：接口除了 Cookie，也认 HTTP Basic（用的是同一套站内账号口令，
+管理员和普通用户都可以），方便 `curl` 和 `install.sh` 自检，不用先去登录页拿 Cookie。
 
 ---
 
@@ -283,7 +313,11 @@ curl -s -u "$ADMIN_USER:$ADMIN_PASSWORD" 'http://localhost/functions/v1/app?acti
    它会生成 `deploy/migrate/restore-progress.js`；
 5. 打开**新站点**，F12 → Console，把 `restore-progress.js` 全部内容粘贴运行，然后刷新页面。
 
-进度就回来了。这一步随时可以做，不影响网站先用起来。
+进度就回来了。这一步**只需要做一次**：新站点上登录账号之后，进度会自动同步到服务器，
+以后换设备只要登同一个账号就能找回来，不用再碰控制台。这一步随时可以做，不影响网站先用起来。
+
+> 顺序上建议：先在新站点注册/登录 → 再做上面这五步把旧进度灌进 localStorage →
+> 灌完刷新页面，登录状态下改动会自动上传到服务器。
 
 ### 7b. 后台手动加过的题
 
@@ -330,8 +364,9 @@ sudo systemctl restart cpubiomed
 
 ## 8. HTTPS（建议做）
 
-现在是明文 HTTP，口令在网络上是可被窃听的。有域名的话按下面走；只有 IP 的话，
-至少把 `ADMIN_PASSWORD` 当成一次性口令，别和其他账号复用。
+现在是明文 HTTP，**登录口令和会话 Cookie 在网络上都是可被窃听的**——拿到 Cookie 就等于
+拿到那个账号（有效期 30 天）。有域名的话按下面走；只有 IP 的话，至少把 `ADMIN_PASSWORD`
+当成一次性口令，别和其他账号复用，也别在公共网络上登录管理员账号。
 
 ```bash
 # 1. 域名 A 记录指向服务器 IP，等生效
@@ -411,9 +446,49 @@ gunzip -c backup-2026-10-19.sql.gz | sudo -u postgres psql cpubiomed
 - 改 `web/data/questions_extra.js` 之类的内容文件 —— 静态兜底数据变了，但**数据库不会自动跟着变**，
   需要在「内容管理」里点一次「一键上传」（只插不改，不会覆盖你已有的编辑）。
 
-**改口令**：编辑 `deploy/.env` 里的 `ADMIN_PASSWORD`，然后 Docker 路线跑
+**改管理员口令**：编辑 `deploy/.env` 里的 `ADMIN_PASSWORD`，然后 Docker 路线跑
 `docker compose up -d api`、原生路线重跑 `sudo bash deploy/native/install.sh`。
-所有者身份固定记作 `admin`，改用户名或口令都不会把自己锁在门外。
+服务启动时会把它同步回 `app_users`，所以改口令不会把自己锁在门外。
+**注意**：如果你没填 `SESSION_SECRET`（默认就是留空，从口令派生），改口令会让**所有人**
+的会话失效，需要重新登录一次。想避免这个副作用，就在 `.env` 里固定一个 `SESSION_SECRET`。
+
+**忘了口令 / 想直接改数据库里的账号**：
+
+```bash
+# Docker 路线
+docker compose exec db psql -U cpubiomed -d cpubiomed
+
+# 原生路线
+sudo -u postgres psql -d cpubiomed
+```
+
+```sql
+SELECT user_id, username, display_name, role, created_at FROM app_users ORDER BY created_at;
+
+-- 把某个注册用户提成管理员（角色是每次请求现查数据库的，让他刷新一下页面就会出现「内容管理」）
+UPDATE app_users SET role = 'admin', updated_at = now() WHERE username = '某人';
+
+-- 删掉一个账号（user_progress 有 ON DELETE CASCADE，进度会一起删掉）
+DELETE FROM app_users WHERE username = '某人';
+```
+
+口令是 scrypt 散列存的，数据库里看不到原文、也没法直接改。**管理员**改 `.env` 再重启就能重置；
+**普通用户没有找回密码的流程**（没接邮件服务），只能删掉账号让他重新注册——进度会跟着一起没，
+所以删之前可以先 `SELECT data FROM user_progress WHERE user_id = '…'` 存一份。
+
+**升级到带账号体系的新版本**：`schema.sql` 全是 `IF NOT EXISTS`，重复执行安全。
+
+```bash
+# 原生路线：重跑安装脚本就会自动补表
+cd ~/cpubiomed && sudo bash deploy/native/install.sh
+
+# Docker 路线：schema.sql 只在数据卷第一次初始化时执行，要手动补一次
+docker compose exec -T db psql -U cpubiomed -d cpubiomed < schema.sql
+docker compose restart api
+```
+
+老库里如果已经有 `site_settings` 表（更早版本的 Qoder 兼容遗留），它现在没人用了，
+留着不影响运行，想清掉就 `DROP TABLE site_settings;`。
 
 ---
 
@@ -423,12 +498,19 @@ Qoder 站点还在，随时可以用 https://cpu-biomed-q1r9t5025uh.qoder.websit
 但要注意：**服务器上新加的题不会自动同步回 Qoder 云端**，两边从此刻起各自独立。
 如果打算长期以服务器为准，Qoder 那边就当成只读快照，别再在两边同时改内容。
 
+账号体系也不会跟着回去：Qoder 那一侧的 `functions/` 已经冻结，没有 `app_users`、
+没有登录页、没有进度同步，身份仍然由平台网关判定（在「内容管理」里点一次
+「启用后台管理」来认领所有者）。服务器上的账号和进度快照只存在于你自己的数据库里。
+
 ---
 
 ## 11. 需要你知道的边界
 
-- **本地验证做到哪一步**：接口逻辑用内存数据库替身跑过 93 项断言（认证、路径穿越防护、
-  全部 action、全部字段校验、353 条真实种子数据灌入、幂等性、后台编辑不被覆盖），全部通过。
+- **本地验证做到哪一步**：接口逻辑用内存数据库替身跑过 158 项断言（注册/登录/会话签名、
+  角色权限、HTTP Basic 兜底、路径穿越防护、全部 action、全部字段校验、进度快照读写与 1 MB 上限、
+  353 条真实种子数据灌入、幂等性、后台编辑不被覆盖），全部通过；前端也开着真浏览器把
+  匿名浏览 → 注册 → 角色化导航 → 非管理员锁定页 → 管理员改题库 → 做完题后的登录提示 →
+  清空 localStorage 后从服务器找回进度这条链子整个走了一遍。
   **但没有在真实 PostgreSQL / 真实 nginx 上跑过**，本机既没装 Docker 也没有 Linux 环境。
   第 6 节的验证清单第一次在服务器上执行时，才是真正的端到端确认。
 - **原生安装脚本 `deploy/native/install.sh` 同样没有实机跑过**。本机验证到的是：
@@ -438,14 +520,28 @@ Qoder 站点还在，随时可以用 https://cpu-biomed-q1r9t5025uh.qoder.websit
   值里含等号、下划线加数字的库名）；npmmirror 的 Node 20 清单能解析出
   `node-v20.19.5-linux-x64.tar.xz` 与 arm64 对应包、sha256 校验行格式与 `sha256sum -c`
   兼容；systemd 单元与 nginx 配置的占位符替换无残留。
-  **apt 安装、建库建表、systemd 启动、nginx 反代这四步只有静态审查。**
+  这轮新加的 `SESSION_SECRET` 校验（留空放行、非 32 位字母数字拦下）**只做了语法检查，
+  没有逐组实测**。
+  **apt 安装、建库建表、systemd 启动、nginx 反代、末尾那几条自检也只有静态审查。**
 - **nginx 与 TLS 配置未经实机验证**，证书路径和续期钩子可能要按你的发行版微调。
-- **前端有一处文案对不上**：`web/api.js` 里 401 的提示写的是「需要先登录 Qoder 账号」。
-  自建部署下浏览器在打开页面时就已经弹过口令框了，正常操作走不到这个分支；
-  万一看到这句话，实际含义是「口令没填对或被清掉了」。
-- **内容版权**：题库里有真题和商业习题册的题目，所以**运行中的站点**默认整站加口令、
-  不对外开放，别把它做成公开站点，也别分享给不特定人群。
+- **页面和题库现在是公开可读的**——这是「浏览做题不要求登录」的直接代价：
+  静态文件、`web/data/*.js` 的内置题库、以及 `?action=bank` 接口都不再需要任何凭证，
+  知道地址的人都能抓到全量题库（真题 + 商业习题册内容）。
+  **这一条改变了运行中站点的暴露面，需要你明确认可**；如果不想这样，要么回到整站加口令
+  的旧模型（那就等于恢复了进站拦路），要么用 nginx 的 `allow`/`deny` 或防火墙把
+  80/443 限制到你自己的 IP。
   （代码仓库 `github.com/AeroBeats/cpu_biomed` 是公开的，里面含全量题库——这是你
   2026-10-18 明确选择的，与站点是否公开是两件事。）
-- **口令强度**：HTTP Basic 在明文 HTTP 上等于把口令直接发出去。上 HTTPS 之前，
-  `ADMIN_PASSWORD` 请当成随时可换的临时口令。
+- **注册是开放的，且没有速率限制**：任何能访问站点的人都能注册一个账号，每个账号最多
+  往 `user_progress` 里写 1 MB。熟人小圈子用没问题，公开挂出去就会被人刷账号占空间。
+  要收紧的话，最直接的是在 nginx 上限制来源 IP，或者把注册接口关掉（`deploy/server/handler.mjs`
+  里的 `register` 分支）。
+- **退出登录不能吊销已签发的会话**：会话是无状态的 HMAC 签名 Cookie（有效期 30 天），
+  「退出」只是清掉本机 Cookie，那串值本身在过期前仍然有效。想让所有已发出的会话立刻失效，
+  唯一的办法是换掉 `SESSION_SECRET`（没填它的话，改 `ADMIN_PASSWORD` 也有同样效果，
+  因为密钥是从口令派生的）——代价是所有人都要重新登录。
+- **进度是整份覆盖，不是合并**：localStorage 始终是主存储，服务器只是一份快照，
+  谁的 `savedAt` 新谁说了算。两台设备同时离线刷题、再先后联网，**后同步的那份会把先同步的整份盖掉**，
+  被盖掉的那些答题记录找不回来。一个人一台设备用不会有这个问题。
+- **口令强度**：明文 HTTP 上，登录口令和会话 Cookie 都等于直接发出去。上 HTTPS 之前，
+  `ADMIN_PASSWORD` 请当成随时可换的临时口令，也别在公共网络上登录管理员账号。

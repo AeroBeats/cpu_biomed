@@ -1,5 +1,7 @@
 -- 药大生医初试复习台 · 自建服务器数据库结构
--- 与 Qoder Sites 云端已应用的 schema v1 完全一致，仅把 app schema 换成 public。
+-- 内容三表与 Qoder Sites 云端已应用的 schema v1 一致，仅把 app schema 换成 public。
+-- app_users / user_progress 只存在于自建部署：账号与进度同步是自建服务独有的能力，
+-- Qoder 站点那边由平台网关提供身份，不需要同样的表。
 -- 由 docker-entrypoint-initdb.d 在数据卷首次初始化时自动执行；
 -- 也可手工执行：psql "$DATABASE_URL" -f schema.sql
 
@@ -52,9 +54,21 @@ CREATE TABLE IF NOT EXISTS cards (
 );
 CREATE INDEX IF NOT EXISTS cards_subject_idx ON cards USING btree (subject);
 
-CREATE TABLE IF NOT EXISTS site_settings (
-  id         text         NOT NULL,
-  owner_id   text         NOT NULL,
-  updated_at timestamptz  NOT NULL,
-  PRIMARY KEY (id)
+CREATE TABLE IF NOT EXISTS app_users (
+  user_id      text        NOT NULL,
+  username     text        NOT NULL,
+  pass_hash    text        NOT NULL,
+  role         text        NOT NULL,
+  display_name text        NOT NULL DEFAULT '',
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id),
+  CONSTRAINT app_users_username_key UNIQUE (username),
+  CONSTRAINT app_users_role_check CHECK (role IN ('admin', 'user'))
+);
+
+CREATE TABLE IF NOT EXISTS user_progress (
+  user_id    text        NOT NULL PRIMARY KEY REFERENCES app_users (user_id) ON DELETE CASCADE,
+  data       jsonb       NOT NULL DEFAULT '{}'::jsonb,
+  updated_at timestamptz NOT NULL DEFAULT now()
 );

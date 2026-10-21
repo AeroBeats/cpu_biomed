@@ -120,3 +120,41 @@ export function parseBody(text) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new AppError('invalid_request', 400);
   return value;
 }
+
+/* ---------------- 账号与进度 ---------------- */
+
+const USERNAME_RE = /^[a-z0-9_.-]{3,32}$/;
+const CONTROL_RE = /[\u0000-\u001f\u007f]/;
+export const MAX_PROGRESS_BYTES = 1024 * 1024;
+
+// 一律转小写存库，登录时同样转，避免 "Admin" 和 "admin" 变成两个账号。
+export function usernameOf(value) {
+  const name = str(value, 3, 32, 'username').toLowerCase();
+  if (!USERNAME_RE.test(name)) bad('username');
+  return name;
+}
+
+export function passwordOf(value) {
+  const password = str(value, 8, 128, 'password');
+  if (CONTROL_RE.test(password)) bad('password');
+  return password;
+}
+
+export function displayNameOf(value) {
+  const name = str(value, 1, 40, 'display_name', true);
+  if (name === null) return '';
+  if (CONTROL_RE.test(name)) bad('display_name');
+  return name.trim();
+}
+
+export function progressData(body) {
+  const data = body.data;
+  if (!data || typeof data !== 'object' || Array.isArray(data)) bad('data');
+  let text;
+  try { text = JSON.stringify(data); } catch { bad('data'); }
+  // 注册是开放的，所以每个账号能往库里塞多少进度必须有个上限。
+  if (Buffer.byteLength(text, 'utf8') > MAX_PROGRESS_BYTES) {
+    throw new AppError('progress_too_large', 413, 'data');
+  }
+  return data;
+}

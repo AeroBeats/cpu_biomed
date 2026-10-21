@@ -65,6 +65,8 @@ DB_NAME=$(read_env POSTGRES_DB)
 DB_USER=$(read_env POSTGRES_USER)
 DB_PASS=$(read_env POSTGRES_PASSWORD)
 HTTP_PORT=$(read_env HTTP_PORT); HTTP_PORT=${HTTP_PORT:-80}
+# 可选：不填就从管理员口令派生会话密钥，代价是改口令会让所有人重新登录一次。
+SESSION_SECRET=$(read_env SESSION_SECRET)
 
 for pair in "ADMIN_USER:$ADMIN_USER" "ADMIN_PASSWORD:$ADMIN_PASS" \
             "POSTGRES_DB:$DB_NAME" "POSTGRES_USER:$DB_USER" "POSTGRES_PASSWORD:$DB_PASS"; do
@@ -90,6 +92,11 @@ for pair in "ADMIN_PASSWORD:$ADMIN_PASS" "POSTGRES_PASSWORD:$DB_PASS"; do
   [[ "${pair#*:}" =~ ^[A-Za-z0-9]+$ ]] \
     || die "${pair%%:*} 只能是字母和数字（用 openssl rand -hex 24 生成，不要用 base64）"
 done
+
+if [ -n "$SESSION_SECRET" ]; then
+  [[ "$SESSION_SECRET" =~ ^[A-Za-z0-9]+$ ]] && [ "${#SESSION_SECRET}" -ge 32 ] \
+    || die "SESSION_SECRET 要是至少 32 位的字母数字（用 openssl rand -hex 32 生成），或者干脆留空"
+fi
 
 ok "配置读取完毕（站点端口 $HTTP_PORT，数据库 $DB_NAME，架构 $NODE_ARCH）"
 
@@ -209,6 +216,7 @@ DATABASE_URL=postgres://$DB_USER:$DB_PASS@127.0.0.1:5432/$DB_NAME
 ADMIN_USER=$ADMIN_USER
 ADMIN_PASSWORD=$ADMIN_PASS
 EOF
+  if [ -n "$SESSION_SECRET" ]; then echo "SESSION_SECRET=$SESSION_SECRET" >> "$ENV_FILE"; fi
 )
 chmod 600 "$ENV_FILE"
 ok "$ENV_FILE（600，仅 root 可读）"
@@ -251,9 +259,22 @@ HEALTH=$(curl -fsS --max-time 10 http://127.0.0.1:8080/healthz || echo '')
 [ "$HEALTH" = '{"ok":true}' ] || die "healthz 返回异常：${HEALTH:-无响应}"
 ok "healthz: $HEALTH"
 
+# 页面公开可读：浏览和做题都不需要登录，登录只在同步进度、管理内容时才要。
 CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://127.0.0.1:$HTTP_PORT/")
-[ "$CODE" = 401 ] || die "首页应返回 401（要求登录），实际 $CODE"
-ok "首页未带口令时返回 401，认证生效"
+[ "$CODE" = 200 ] || die "首页应返回 200（公开可读），实际 $CODE"
+ok "首页公开可读，返回 200"
+
+CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+  "http://127.0.0.1:$HTTP_PORT/functions/v1/app?action=progress")
+[ "$CODE" = 401 ] || die "未登录读进度应返回 401，实际 $CODE"
+ok "未登录访问进度接口返回 401，登录校验生效"
+
+# 管理员由 .env 在启动时落库；这一步没成功的话谁都登不进去。
+ADMIN_ROLE=$(as_postgres psql -tA -d "$DB_NAME" -c \
+  "SELECT role FROM app_users WHERE username = lower('$ADMIN_USER')" 2>/dev/null || echo '')
+[ "$ADMIN_ROLE" = admin ] || die "管理员账号 $ADMIN_USER 没有落库（当前：${ADMIN_ROLE:-查不到}），
+    看 journalctl -u $SERVICE_NAME -n 30"
+ok "管理员账号 $ADMIN_USER 已落库，角色 admin"
 
 BANK=$(curl -fsS --max-time 30 -u "$ADMIN_USER:$ADMIN_PASS" \
   "http://127.0.0.1:$HTTP_PORT/functions/v1/app?action=bank" || echo '')
@@ -272,13 +293,14 @@ cat <<DONE
 
 部署完成。
 
-  站点      http://<服务器IP>$([ "$HTTP_PORT" = 80 ] || echo ":$HTTP_PORT")/
-  登录      用户名 $ADMIN_USER，口令见 $ENV_FILE
-  日志      journalctl -u $SERVICE_NAME -f
-  重启      systemctl restart $SERVICE_NAME
+  站点        http://<服务器IP>$([ "$HTTP_PORT" = 80 ] || echo ":$HTTP_PORT")/
+  管理员账号  $ADMIN_USER（口令见 $ENV_FILE）
+  日志        journalctl -u $SERVICE_NAME -f
+  重启        systemctl restart $SERVICE_NAME
 
 下一步（在你自己电脑的浏览器里做）：
-  1. 打开站点，用上面的口令登录
+  1. 打开站点，右下角「登录 / 注册」里用上面的管理员账号登录，
+     登录后导航里会自动出现「内容管理」
   2. 迁移学习进度：见 deploy/README.md 第 7a 节
   3. 配 HTTPS：见 deploy/README.md 第 8 节
 DONE

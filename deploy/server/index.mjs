@@ -1,13 +1,16 @@
 /* 药大生医初试复习台 · 自建服务
-   一个进程同时负责：静态页面、题库接口、HTTP Basic 认证。
-   接口路径沿用 /functions/v1/app，所以前端 web/api.js 不需要任何改动。 */
+   一个进程同时负责：静态页面、题库/账号接口、会话认证。
+   接口路径沿用 /functions/v1/app，所以前端 web/api.js 不需要任何改动。
+
+   页面与内置数据文件是公开可读的，登录只在需要时发生（同步进度、管理内容）；
+   要口令保护内容，请在 nginx 那层加，不要指望这个进程。 */
 
 import http from 'node:http';
 import { stat, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createDb } from './db.mjs';
-import { createAuth } from './auth.mjs';
+import { createAuth, verifyPassword, SESSION_COOKIE } from './auth.mjs';
 import { handleBank } from './handler.mjs';
 import { AppError } from './validate.mjs';
 import { loadContent, seedIfEmpty } from './seed.mjs';
@@ -97,6 +100,46 @@ async function serveStatic(req, res, urlPath) {
   send(res, 200, { 'content-type': type, 'cache-control': 'no-cache', 'content-length': file.length }, file);
 }
 
+function parseCookies(header) {
+  const out = {};
+  if (typeof header !== 'string') return out;
+  for (const part of header.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx < 1) continue;
+    const name = part.slice(0, idx).trim();
+    if (name && !(name in out)) out[name] = part.slice(idx + 1).trim();
+  }
+  return out;
+}
+
+// nginx 会把 x-forwarded-proto 传进来；直连时看 socket 是否已经是 TLS。
+function isSecure(req) {
+  if (req.socket && req.socket.encrypted) return true;
+  const proto = req.headers['x-forwarded-proto'];
+  const first = Array.isArray(proto) ? proto[0] : proto;
+  return typeof first === 'string' && first.split(',')[0].trim().toLowerCase() === 'https';
+}
+
+/** 会话 Cookie 优先，其次 HTTP Basic（留给 curl 与安装脚本自检）。
+    角色每次都回库读，所以撤权立即生效。查不到就当匿名，绝不抛错挡住静态页面。 */
+async function resolveUser(req, db, auth) {
+  try {
+    const session = auth.readSession(parseCookies(req.headers.cookie)[SESSION_COOKIE]);
+    if (session) {
+      const row = await db.findUser(session.userId);
+      if (row) return row;
+    }
+    const basic = auth.basicCredentials(req.headers.authorization);
+    if (basic) {
+      const row = await db.findUserByUsername(basic.username.toLowerCase());
+      if (row && await verifyPassword(basic.password, row.pass_hash)) return row;
+    }
+  } catch (e) {
+    console.error('读取登录状态失败，本次请求按未登录处理:', e instanceof Error ? e.message : e);
+  }
+  return null;
+}
+
 export function createServer({ db, auth }) {
   return http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://internal');
@@ -110,27 +153,20 @@ export function createServer({ db, auth }) {
       }
     }
 
-    const user = auth.getUser(req.headers.authorization);
-    if (!user) {
-      return send(res, 401, {
-        ...auth.challengeHeaders(),
-        'content-type': 'text/plain; charset=utf-8',
-        'cache-control': 'no-store',
-      }, '需要登录后才能访问');
-    }
+    const user = await resolveUser(req, db, auth);
 
     try {
       if (url.pathname === API_PATH) {
         let bodyText = '';
         if (req.method === 'POST') bodyText = await readBody(req);
-        const result = await handleBank({ method: req.method, url: req.url, user, bodyText }, db);
+        const result = await handleBank(
+          { method: req.method, url: req.url, user, bodyText, secure: isSecure(req) }, db, auth);
         return sendJson(res, result.status, result.body, result.headers);
       }
       return await serveStatic(req, res, url.pathname);
     } catch (e) {
       if (e instanceof AppError) {
-        return sendJson(res, e.status, { error: e.code, ...(e.field ? { field: e.field } : {}) },
-          e.code === 'login_required' ? auth.challengeHeaders() : {});
+        return sendJson(res, e.status, { error: e.code, ...(e.field ? { field: e.field } : {}) });
       }
       console.error('请求处理失败:', e instanceof Error ? e.message : e);
       return sendJson(res, 500, { error: 'server_error' });
@@ -175,8 +211,15 @@ async function main() {
     } catch (e) {
       console.error('初始化灌入失败:', e instanceof Error ? e.message : e);
     }
+    try {
+      const result = await auth.ensureAdmin(db);
+      console.log(`管理员账号 ${auth.adminUsername} 已${result === 'created' ? '创建' : '同步口令'}`);
+    } catch (e) {
+      // 管理员建不起来意味着谁都登不进去，这比题库灌入失败严重得多，要显眼地报出来。
+      console.error('管理员账号初始化失败，登录与后台管理将不可用:', e instanceof Error ? e.message : e);
+    }
   } else {
-    console.error('数据库不可用，仍继续启动：页面可访问，题库接口会回落到前端内置数据');
+    console.error('数据库不可用，仍继续启动：页面可访问，题库接口会回落到前端内置数据，登录不可用');
   }
 
   const server = createServer({ db, auth });

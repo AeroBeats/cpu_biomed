@@ -348,7 +348,7 @@ kbd {
 .field:last-child { margin-bottom: 0; }
 .field > label, .field-label { display: block; font-size: 12.5px; font-weight: 620; color: var(--ink-2); margin-bottom: 8px; letter-spacing: .01em; }
 .chip-row { display: flex; flex-wrap: wrap; gap: 7px; }
-input[type="text"], input[type="date"], input[type="number"], select, textarea {
+input[type="text"], input[type="password"], input[type="date"], input[type="number"], select, textarea {
   width: 100%; padding: 9px 12px; border-radius: var(--r-md);
   border: 1px solid var(--line-2); background: var(--surface);
   font-family: inherit; font-size: 13.5px; color: var(--ink);
@@ -790,6 +790,63 @@ details.reveal .rev-body strong { color: var(--ink); }
 }
 .adm-sub { margin-top: 3px; font-family: var(--mono); font-size: 11px; color: var(--ink-3); }
 .adm-act { display: flex; gap: 7px; flex: 0 0 auto; }
+
+/* ---------- 账号与登录 ---------- */
+.acc-card { max-width: 520px; }
+.acc-field { display: block; margin-bottom: 14px; }
+.acc-field > span { display: block; font-size: 12.5px; font-weight: 620; color: var(--ink-2); margin-bottom: 7px; }
+.acc-field small { display: block; margin-top: 6px; font-size: 11.5px; color: var(--ink-3); line-height: 1.6; }
+.acc-msg {
+  margin-bottom: 14px; padding: 10px 13px; border-radius: var(--r-sm);
+  border: 1px solid var(--line); border-left: 3px solid var(--line-2);
+  font-size: 13px; line-height: 1.7;
+}
+.acc-msg[hidden] { display: none; }
+.acc-msg.is-err { background: var(--bad-soft); border-color: var(--pol-line); border-left-color: var(--bad); color: #7A1D17; }
+.acc-msg.is-ok { background: var(--ok-soft); border-color: #BEE0CC; border-left-color: var(--ok); color: #14532D; }
+.btn-block { display: block; width: 100%; text-align: center; margin-top: 4px; }
+.acc-id { display: flex; align-items: center; gap: 13px; margin-bottom: 16px; }
+.acc-idtext b { display: block; font-size: 16px; color: var(--ink); }
+.acc-sub { margin: 3px 0 0; font-size: 12px; color: var(--ink-3); }
+.acc-avatar {
+  display: flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px; flex: 0 0 auto; border-radius: 50%;
+  background: var(--brand-soft); border: 1px solid var(--brand-line);
+  color: var(--brand-deep); font-size: 14px; font-weight: 700;
+}
+.acc-avatar-lg { width: 46px; height: 46px; font-size: 20px; }
+.acc-sync {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 13px; border-radius: var(--r-sm);
+  background: var(--surface-sunken); border: 1px solid var(--line);
+  font-size: 12.5px; color: var(--ink-2); line-height: 1.6;
+}
+
+/* 侧栏底部的账号入口 */
+.acc-chip {
+  display: flex; align-items: center; gap: 9px; width: 100%;
+  padding: 8px 10px; margin-bottom: 9px; border-radius: var(--r-md);
+  border: 1px solid rgba(255,255,255,.12); background: rgba(255,255,255,.05);
+  color: #DCE7EA; text-align: left; text-decoration: none;
+  transition: border-color .15s, background .15s;
+}
+.acc-chip:hover { border-color: rgba(255,255,255,.26); background: rgba(255,255,255,.1); }
+.acc-chip .acc-avatar { width: 26px; height: 26px; font-size: 12.5px; }
+.acc-meta { flex: 1; min-width: 0; }
+.acc-meta b { display: block; font-size: 12.5px; font-weight: 620; color: #EAF2F4;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acc-role { display: block; font-size: 10.5px; color: #7E9AA3; margin-top: 1px; }
+.acc-go { font-size: 16px; color: #63818A; }
+
+/* 做题结束时的登录提示：不拦路，只在这一刻说一句 */
+.sync-hint {
+  display: flex; align-items: flex-start; gap: 9px;
+  margin: 18px 0 0; padding: 11px 13px; border-radius: var(--r-md);
+  background: var(--surface-sunken); border: 1px dashed var(--line-2);
+  font-size: 12.5px; line-height: 1.7; color: var(--ink-2); text-align: left;
+}
+.sync-hint svg { flex: 0 0 auto; margin-top: 2px; color: var(--brand); }
+.sync-hint a { color: var(--brand); font-weight: 620; }
 
 /* ---------- 响应式 ---------- */
 @media (max-width: 1080px) {

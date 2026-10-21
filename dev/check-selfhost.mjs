@@ -1,5 +1,5 @@
 /* 自建后端本地验证：node dev/check-selfhost.mjs
-   用内存数据库替身跑通认证、静态托管、全部 action 与校验规则，
+   用内存数据库替身跑通账号会话、静态托管、全部 action 与校验规则，
    并把 deploy/server/content.json 整份灌一遍，确认 353 条种子数据都能通过校验。
    不需要 Docker、不需要 pg、不需要联网。 */
 
@@ -11,14 +11,16 @@ const ROOT = path.resolve(HERE, '..');
 process.env.SITE_ROOT = path.join(ROOT, 'web');
 
 const { createServer } = await import('../deploy/server/index.mjs');
-const { createAuth } = await import('../deploy/server/auth.mjs');
+const { createAuth, hashPassword, verifyPassword, SESSION_COOKIE } = await import('../deploy/server/auth.mjs');
 const { loadContent, seedIfEmpty } = await import('../deploy/server/seed.mjs');
 const { createMemoryDb } = await import('./memory-db.mjs');
 
 const USER = 'owner';
 const PASS = 'test-password-123';
+const API = '/functions/v1/app';
 const GOOD = 'Basic ' + Buffer.from(USER + ':' + PASS).toString('base64');
 const BADPASS = 'Basic ' + Buffer.from(USER + ':wrong').toString('base64');
+const cookieOf = (res) => (res.headers.get('set-cookie') || '').split(';')[0];
 
 let passed = 0;
 const failures = [];
@@ -37,18 +39,27 @@ function listen(server) {
 }
 const close = (server) => new Promise((r) => server.close(r));
 
-async function start(db) {
-  const auth = createAuth({ ADMIN_USER: USER, ADMIN_PASSWORD: PASS });
+function request(base, method, url, body, headers) {
+  return fetch(base + url, {
+    method,
+    headers: { ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}), ...headers },
+    body: body === undefined ? undefined : (typeof body === 'string' ? body : JSON.stringify(body)),
+  });
+}
+
+async function start(db, env = { ADMIN_USER: USER, ADMIN_PASSWORD: PASS }) {
+  const auth = createAuth(env);
+  const boot = await auth.ensureAdmin(db);
   const server = createServer({ db, auth });
   const port = await listen(server);
   const base = 'http://127.0.0.1:' + port;
-  const call = (method, url, body, headers = {}) =>
-    fetch(base + url, {
-      method,
-      headers: { Authorization: GOOD, ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}), ...headers },
-      body: body === undefined ? undefined : (typeof body === 'string' ? body : JSON.stringify(body)),
-    });
-  return { server, base, call, auth };
+  return {
+    server, base, auth, boot,
+    // 匿名请求：不带任何凭据。
+    anon: (method, url, body, headers) => request(base, method, url, body, headers),
+    // 管理员请求：默认走 Basic，模拟 curl -u 的自检路径；传 Cookie 可覆盖。
+    call: (method, url, body, headers) => request(base, method, url, body, { Authorization: GOOD, ...headers }),
+  };
 }
 
 const sampleQuestion = (id, over = {}) => ({
@@ -57,160 +68,291 @@ const sampleQuestion = (id, over = {}) => ({
   answer: 1, explain_text: '因为乙正确。', sort_order: null, ...over,
 });
 
-/* ============ 第一阶段：认证、静态托管、接口契约 ============ */
+/* ============ 第一阶段：账号、会话与访问边界 ============ */
 {
   const db = createMemoryDb();
-  const { server, base, call, auth } = await start(db);
+  const { server, base, anon, call, auth, boot } = await start(db);
 
   check('auth 配置生效', auth.configured === true);
-  eq('auth 合法口令 → admin 身份', auth.getUser(GOOD), { user_id: 'admin', name: USER });
-  eq('auth 错误口令 → null', auth.getUser(BADPASS), null);
-  eq('auth 无凭据 → null', auth.getUser(undefined), null);
-  eq('auth 畸形凭据 → null', auth.getUser('Basic !!!not-base64!!!'), null);
-  eq('auth 无冒号凭据 → null', auth.getUser('Basic ' + Buffer.from('nocolon').toString('base64')), null);
-  check('未配口令时拒绝放行', createAuth({ ADMIN_USER: 'a', ADMIN_PASSWORD: '' }).getUser(GOOD) === null
-    && createAuth({ ADMIN_USER: 'a', ADMIN_PASSWORD: '' }).configured === false);
+  eq('启动时创建管理员', boot, 'created');
+  eq('管理员角色为 admin', (await db.findUserByUsername(USER)).role, 'admin');
+  eq('口令以散列入库', (await db.findUserByUsername(USER)).pass_hash.startsWith('scrypt$'), true);
+  eq('重复启动只同步口令', await createAuth({ ADMIN_USER: USER, ADMIN_PASSWORD: PASS }).ensureAdmin(db), 'synced');
+  check('未配口令时拒绝发放身份', createAuth({ ADMIN_USER: 'a', ADMIN_PASSWORD: '' }).configured === false);
 
-  // 健康检查不鉴权（compose healthcheck 用）
+  // 口令散列
+  const hashed = await hashPassword('s3cret-pass');
+  check('散列不含明文', hashed.indexOf('s3cret-pass') === -1 && hashed.startsWith('scrypt$'), hashed);
+  eq('散列可校验', await verifyPassword('s3cret-pass', hashed), true);
+  eq('错口令校验失败', await verifyPassword('s3cret-pasS', hashed), false);
+  eq('两次散列盐不同', await hashPassword('s3cret-pass') === hashed, false);
+  eq('畸形散列串不抛异常', await verifyPassword('x', 'not-a-hash'), false);
+  eq('被改过的 scrypt 参数不接受', await verifyPassword('s3cret-pass', hashed.replace('$16384$', '$1024$')), false);
+
+  // 会话签名
+  const token = auth.signSession('u_test');
+  eq('会话可解析', auth.readSession(token).userId, 'u_test');
+  eq('篡改签名 → null', auth.readSession(token.slice(0, -2) + 'aa'), null);
+  eq('篡改载荷 → null', auth.readSession(
+    's1.' + Buffer.from('{"u":"u_evil","e":9000000000000000}').toString('base64url') + token.slice(token.lastIndexOf('.')),
+  ), null);
+  eq('已过期 → null', auth.readSession(auth.signSession('u_test', Date.now() - auth.sessionTtlMs - 1000)), null);
+  eq('非本站格式 → null', auth.readSession('garbage'), null);
+  eq('空值 → null', auth.readSession(undefined), null);
+  const setCookie = auth.setCookieHeader(token, false);
+  check('会话 Cookie 为 HttpOnly', /HttpOnly/.test(setCookie), setCookie);
+  check('会话 Cookie 为 SameSite=Lax', /SameSite=Lax/.test(setCookie), setCookie);
+  check('明文 HTTP 下不加 Secure', !/Secure/.test(setCookie), setCookie);
+  check('HTTPS 下追加 Secure', /; Secure/.test(auth.setCookieHeader(token, true)));
+  eq('换 SESSION_SECRET 后旧会话失效',
+    createAuth({ ADMIN_USER: USER, ADMIN_PASSWORD: PASS, SESSION_SECRET: 'other' }).readSession(token), null);
+
+  // 健康检查与静态页面：都不需要登录
   const hz = await fetch(base + '/healthz');
-  check('healthz 免认证且 200', hz.status === 200, hz.status);
+  eq('healthz 免认证且 200', hz.status, 200);
   eq('healthz body', await hz.json(), { ok: true });
 
-  const anon = await fetch(base + '/');
-  eq('未登录访问首页 → 401', anon.status, 401);
-  check('401 带 WWW-Authenticate 触发浏览器弹窗', /Basic realm=/.test(anon.headers.get('www-authenticate') || ''),
-    anon.headers.get('www-authenticate'));
-
-  const home = await call('GET', '/');
+  const home = await anon('GET', '/');
   const homeText = await home.text();
-  eq('登录后首页 200', home.status, 200);
+  eq('未登录也能打开首页', home.status, 200);
   check('首页是复习台页面', homeText.includes('药大生医') && homeText.includes('id="app"'));
   check('首页 no-cache', /no-cache/.test(home.headers.get('cache-control') || ''));
-  check('首页带 nosniff', home.headers.get('x-content-type-options') === 'nosniff');
+  eq('首页带 nosniff', home.headers.get('x-content-type-options'), 'nosniff');
 
-  const css = await call('GET', '/styles.css');
+  const css = await anon('GET', '/styles.css');
   eq('样式文件 200', css.status, 200);
   check('样式 MIME 正确', /text\/css/.test(css.headers.get('content-type') || ''), css.headers.get('content-type'));
 
-  const extra = await call('GET', '/data/questions_extra.js');
+  const extra = await anon('GET', '/data/questions_extra.js');
   eq('扩充题库脚本 200', extra.status, 200);
   check('扩充题库脚本 MIME 正确', /javascript/.test(extra.headers.get('content-type') || ''));
 
-  const apiScript = await call('GET', '/api.js');
-  eq('接口层脚本 200', apiScript.status, 200);
+  eq('接口层脚本 200', (await anon('GET', '/api.js')).status, 200);
 
   // 路径穿越与隐藏文件
-  eq('编码穿越 → 404', (await call('GET', '/%2e%2e/%2e%2e/deploy/server/package.json')).status, 404);
-  eq('双重编码穿越 → 404', (await call('GET', '/%252e%252e/deploy/schema.sql')).status, 404);
-  eq('绝对路径穿越 → 404', (await call('GET', '/../deploy/.env.example')).status, 404);
-  eq('隐藏文件 → 404', (await call('GET', '/.hidden')).status, 404);
-  eq('不存在文件 → 404', (await call('GET', '/nope.html')).status, 404);
-  eq('目录 → 404', (await call('GET', '/data/')).status, 404);
-  eq('静态文件不允许 POST', (await call('POST', '/styles.css')).status, 405);
-  eq('HEAD 首页可用', (await call('HEAD', '/')).status, 200);
+  eq('编码穿越 → 404', (await anon('GET', '/%2e%2e/%2e%2e/deploy/server/package.json')).status, 404);
+  eq('双重编码穿越 → 404', (await anon('GET', '/%252e%252e/deploy/schema.sql')).status, 404);
+  eq('绝对路径穿越 → 404', (await anon('GET', '/../deploy/.env.example')).status, 404);
+  eq('隐藏文件 → 404', (await anon('GET', '/.hidden')).status, 404);
+  eq('不存在文件 → 404', (await anon('GET', '/nope.html')).status, 404);
+  eq('目录 → 404', (await anon('GET', '/data/')).status, 404);
+  eq('静态文件不允许 POST', (await anon('POST', '/styles.css')).status, 405);
+  eq('HEAD 首页可用', (await anon('HEAD', '/')).status, 200);
 
-  // 接口鉴权与动作契约
-  eq('接口未登录 → 401', (await fetch(base + '/functions/v1/app?action=bank')).status, 401);
-  eq('未知 action → 404', (await call('GET', '/functions/v1/app?action=nope')).status, 404);
-  const wrongMethod = await call('GET', '/functions/v1/app?action=claim-owner');
+  // 匿名身份下的接口契约：读公开，写拒绝
+  eq('匿名 session', await (await anon('GET', API + '?action=session')).json(), { loggedIn: false, user: null });
+  eq('匿名可读题库', (await anon('GET', API + '?action=bank')).status, 200);
+  const anonProgress = await anon('GET', API + '?action=progress');
+  eq('匿名读进度 → 401', anonProgress.status, 401);
+  eq('401 错误码', (await anonProgress.json()).error, 'login_required');
+  // 不能再发 WWW-Authenticate，否则浏览器会弹出原生口令框，把自建登录页顶掉。
+  eq('401 不带认证挑战头', anonProgress.headers.get('www-authenticate'), null);
+  eq('匿名不能写内容 → 401',
+    (await anon('POST', API + '?action=upsert-question', sampleQuestion('q-blocked'))).status, 401);
+
+  eq('未知 action → 404', (await anon('GET', API + '?action=nope')).status, 404);
+  eq('已下线的 owner 动作 → 404', (await anon('GET', API + '?action=owner')).status, 404);
+  eq('已下线的 claim-owner → 404', (await anon('POST', API + '?action=claim-owner', {})).status, 404);
+  const wrongMethod = await anon('GET', API + '?action=login');
   eq('GET 打 POST 动作 → 405', wrongMethod.status, 405);
   eq('405 带 allow 头', wrongMethod.headers.get('allow'), 'POST');
-  eq('POST 打 GET 动作 → 405', (await call('POST', '/functions/v1/app?action=bank', {})).status, 405);
+  eq('POST 打 GET 动作 → 405', (await anon('POST', API + '?action=bank', {})).status, 405);
+  eq('GET 打只允许 POST 的写入 → 405', (await anon('GET', API + '?action=upsert-card')).status, 405);
 
-  const emptyBank = await (await call('GET', '/functions/v1/app?action=bank')).json();
-  eq('空库 bank 结构', emptyBank, { questions: [], chapters: [], cards: [], truncated: false });
-  eq('未启用后台时 owner 状态', await (await call('GET', '/functions/v1/app?action=owner')).json(),
-    { loggedIn: true, hasOwner: false, isOwner: false });
+  eq('空库 bank 结构', await (await anon('GET', API + '?action=bank')).json(),
+    { questions: [], chapters: [], cards: [], truncated: false });
 
-  const blocked = await call('POST', '/functions/v1/app?action=upsert-question', sampleQuestion('q-blocked'));
-  eq('未启用后台不能写 → 409', blocked.status, 409);
-  eq('未启用后台错误码', (await blocked.json()).error, 'owner_not_claimed');
+  // ---------- 登录 ----------
+  const badLogin = await anon('POST', API + '?action=login', { username: USER, password: 'wrong-password' });
+  eq('错口令登录 → 401', badLogin.status, 401);
+  eq('错口令错误码', (await badLogin.json()).error, 'bad_credentials');
+  eq('不存在的用户 → 同样 401',
+    (await anon('POST', API + '?action=login', { username: 'nobody', password: 'wrong-password' })).status, 401);
+  eq('用户名大小写不敏感',
+    (await anon('POST', API + '?action=login', { username: 'OWNER', password: PASS })).status, 200);
+  eq('口令太短的登录请求 → 400',
+    (await anon('POST', API + '?action=login', { username: USER, password: 'x' })).status, 400);
+  eq('登录缺请求体 → 400', (await anon('POST', API + '?action=login', '')).status, 400);
 
-  eq('claim-owner 成功', await (await call('POST', '/functions/v1/app?action=claim-owner', {})).json(),
-    { claimed: true, isOwner: true });
-  eq('claim-owner 幂等', await (await call('POST', '/functions/v1/app?action=claim-owner', {})).json(),
-    { claimed: true, isOwner: true });
-  eq('启用后 owner 状态', await (await call('GET', '/functions/v1/app?action=owner')).json(),
-    { loggedIn: true, hasOwner: true, isOwner: true });
+  const login = await anon('POST', API + '?action=login', { username: USER, password: PASS });
+  eq('管理员登录成功', login.status, 200);
+  const adminCookie = cookieOf(login);
+  check('登录下发会话 Cookie', adminCookie.startsWith(SESSION_COOKIE + '='), adminCookie);
+  const loginBody = await login.json();
+  eq('登录返回 loggedIn', loginBody.loggedIn, true);
+  eq('登录返回管理员身份', { ...loginBody.user, id: typeof loginBody.user.id },
+    { id: 'string', username: USER, name: USER, role: 'admin' });
+  check('响应里不含口令散列', JSON.stringify(loginBody).indexOf('scrypt$') === -1);
 
-  // 增删改
-  eq('新增题目', await (await call('POST', '/functions/v1/app?action=upsert-question', sampleQuestion('q-one'))).json(),
+  const asAdmin = { Cookie: adminCookie };
+  eq('会话 Cookie 可换取身份',
+    (await (await anon('GET', API + '?action=session', undefined, asAdmin)).json()).user.role, 'admin');
+  eq('伪造的 Cookie 视为未登录',
+    await (await anon('GET', API + '?action=session', undefined, { Cookie: SESSION_COOKIE + '=s1.bogus.bogus' })).json(),
+    { loggedIn: false, user: null });
+  eq('畸形 Cookie 头不炸服务', (await anon('GET', '/', undefined, { Cookie: ';;;===' })).status, 200);
+
+  // Basic 仍然可用：curl 与安装脚本自检走这条路
+  eq('Basic 管理员可读 session', (await (await call('GET', API + '?action=session')).json()).user.role, 'admin');
+  eq('Basic 错口令视为未登录',
+    await (await anon('GET', API + '?action=session', undefined, { Authorization: BADPASS })).json(),
+    { loggedIn: false, user: null });
+  eq('Basic 畸形凭据视为未登录',
+    await (await anon('GET', API + '?action=session', undefined, { Authorization: 'Basic !!!' })).json(),
+    { loggedIn: false, user: null });
+  eq('Basic 无冒号凭据视为未登录',
+    await (await anon('GET', API + '?action=session', undefined,
+      { Authorization: 'Basic ' + Buffer.from('nocolon').toString('base64') })).json(),
+    { loggedIn: false, user: null });
+
+  // ---------- 注册与普通用户权限 ----------
+  const reg = await anon('POST', API + '?action=register',
+    { username: 'YanYou', password: 'study-hard-2027', display_name: '研友' });
+  eq('注册成功并自动登录', reg.status, 200);
+  const regBody = await reg.json();
+  eq('用户名统一转小写', regBody.user.username, 'yanyou');
+  eq('新账号是普通用户', regBody.user.role, 'user');
+  eq('显示名保留原样', regBody.user.name, '研友');
+  const userCookie = cookieOf(reg);
+  check('注册也下发会话 Cookie', userCookie.startsWith(SESSION_COOKIE + '='), userCookie);
+  const asUser = { Cookie: userCookie };
+
+  const userWrite = await anon('POST', API + '?action=upsert-question', sampleQuestion('q-nope'), asUser);
+  eq('普通用户写内容 → 403', userWrite.status, 403);
+  eq('403 错误码', (await userWrite.json()).error, 'not_admin');
+  eq('普通用户同步内置 → 403', (await anon('POST', API + '?action=sync-builtin', { questions: [] }, asUser)).status, 403);
+  eq('普通用户删题 → 403', (await anon('POST', API + '?action=delete-question', { id: 'q-one' }, asUser)).status, 403);
+  eq('普通用户可读题库', (await anon('GET', API + '?action=bank', undefined, asUser)).status, 200);
+
+  eq('抢注管理员用户名 → 409',
+    (await anon('POST', API + '?action=register', { username: USER.toUpperCase(), password: 'another-pass-1' })).status, 409);
+  eq('重复注册 → 409',
+    (await anon('POST', API + '?action=register', { username: 'yanyou', password: 'another-pass-1' })).status, 409);
+  eq('409 错误码', (await (await anon('POST', API + '?action=register',
+    { username: 'yanyou', password: 'another-pass-1' })).json()).error, 'username_taken');
+  eq('注册口令太短 → 400',
+    (await anon('POST', API + '?action=register', { username: 'abcd', password: '1234567' })).status, 400);
+  eq('用户名含空格 → 400',
+    (await anon('POST', API + '?action=register', { username: 'a b c', password: 'study-hard-2027' })).status, 400);
+  eq('用户名太短 → 400',
+    (await anon('POST', API + '?action=register', { username: 'ab', password: 'study-hard-2027' })).status, 400);
+  eq('口令含控制字符 → 400',
+    (await anon('POST', API + '?action=register', { username: 'abcd', password: 'study\nhard2027' })).status, 400);
+  eq('不传显示名也能注册',
+    (await (await anon('POST', API + '?action=register', { username: 'second', password: 'study-hard-2027' })).json()).user.name,
+    'second');
+
+  // ---------- 进度同步 ----------
+  const payload = { v: 1, savedAt: 1700000000000, stats: { 'q-1': { right: 2, wrong: 1 } }, days: ['2026-10-21'] };
+  const put = await anon('POST', API + '?action=progress', { data: payload }, asUser);
+  eq('写进度成功', put.status, 200);
+  check('写进度返回服务端时间', typeof (await put.json()).updated_at === 'string');
+  const got = await (await anon('GET', API + '?action=progress', undefined, asUser)).json();
+  eq('进度原样读回', got.data, payload);
+  check('读进度带 updated_at', typeof got.updated_at === 'string');
+
+  eq('进度按账号隔离', await (await anon('GET', API + '?action=progress', undefined, asAdmin)).json(),
+    { data: null, updated_at: null });
+
+  const overwrite = { v: 1, savedAt: 1700000099999, stats: {} };
+  await anon('POST', API + '?action=progress', { data: overwrite }, asUser);
+  eq('再写覆盖旧进度', (await (await anon('GET', API + '?action=progress', undefined, asUser)).json()).data, overwrite);
+
+  eq('进度不是对象 → 400', (await anon('POST', API + '?action=progress', { data: [1, 2] }, asUser)).status, 400);
+  eq('缺 data → 400', (await anon('POST', API + '?action=progress', {}, asUser)).status, 400);
+  const hugeProgress = await anon('POST', API + '?action=progress',
+    { data: { blob: 'x'.repeat(1024 * 1024 + 16) } }, asUser);
+  eq('超大进度 → 413', hugeProgress.status, 413);
+  eq('413 错误码', (await hugeProgress.json()).error, 'progress_too_large');
+
+  // ---------- 退出 ----------
+  const out = await anon('POST', API + '?action=logout', {}, asUser);
+  eq('退出成功', await out.json(), { loggedIn: false, user: null });
+  check('退出清 Cookie', /Max-Age=0/.test(out.headers.get('set-cookie') || ''), out.headers.get('set-cookie'));
+  eq('退出后可用口令重新登录',
+    (await anon('POST', API + '?action=login', { username: 'yanyou', password: 'study-hard-2027' })).status, 200);
+
+  await close(server);
+}
+
+/* ============ 第二阶段：管理员内容增删改 ============ */
+{
+  const db = createMemoryDb();
+  const { server, call } = await start(db);
+
+  eq('新增题目', await (await call('POST', API + '?action=upsert-question', sampleQuestion('q-one'))).json(),
     { id: 'q-one', built_in: false, created: true });
   eq('重复保存同一题 → created false',
-    await (await call('POST', '/functions/v1/app?action=upsert-question', sampleQuestion('q-one', { stem: '改过的题干' }))).json(),
+    await (await call('POST', API + '?action=upsert-question', sampleQuestion('q-one', { stem: '改过的题干' }))).json(),
     { id: 'q-one', built_in: false, created: false });
-  let bank = await (await call('GET', '/functions/v1/app?action=bank')).json();
+  let bank = await (await call('GET', API + '?action=bank')).json();
   eq('编辑已生效', bank.questions[0].stem, '改过的题干');
   eq('未传 sort_order 时落到 9000', bank.questions[0].sort_order, 9000);
 
-  eq('非法 qtype → 400', (await call('POST', '/functions/v1/app?action=upsert-question',
+  eq('非法 qtype → 400', (await call('POST', API + '?action=upsert-question',
     sampleQuestion('q-bad', { qtype: 'essay' }))).status, 400);
-  const badField = await (await call('POST', '/functions/v1/app?action=upsert-question',
-    sampleQuestion('q-bad', { qtype: 'essay' }))).json();
-  eq('400 带字段名', badField, { error: 'invalid_field', field: 'qtype' });
-  eq('答案越界 → 400', (await call('POST', '/functions/v1/app?action=upsert-question',
+  eq('400 带字段名', await (await call('POST', API + '?action=upsert-question',
+    sampleQuestion('q-bad', { qtype: 'essay' }))).json(), { error: 'invalid_field', field: 'qtype' });
+  eq('答案越界 → 400', (await call('POST', API + '?action=upsert-question',
     sampleQuestion('q-bad', { answer: 9 }))).status, 400);
-  eq('非法 id → 400', (await call('POST', '/functions/v1/app?action=upsert-question',
+  eq('非法 id → 400', (await call('POST', API + '?action=upsert-question',
     sampleQuestion('Bad-ID', {}))).status, 400);
-  eq('非法科目 → 400', (await call('POST', '/functions/v1/app?action=upsert-question',
+  eq('非法科目 → 400', (await call('POST', API + '?action=upsert-question',
     sampleQuestion('q-bad', { subject: 'xxx' }))).status, 400);
   eq('多选题答案自动排序去重',
-    (await (await call('POST', '/functions/v1/app?action=upsert-question',
+    (await (await call('POST', API + '?action=upsert-question',
       sampleQuestion('q-multi', { qtype: 'multi', opts: ['甲', '乙', '丙', '丁'], answer: [2, 0] }))).json()).id, 'q-multi');
-  bank = await (await call('GET', '/functions/v1/app?action=bank')).json();
+  bank = await (await call('GET', API + '?action=bank')).json();
   eq('多选答案已排序', bank.questions.find((q) => q.id === 'q-multi').answer, [0, 2]);
-  eq('多选重复选项 → 400', (await call('POST', '/functions/v1/app?action=upsert-question',
+  eq('多选重复选项 → 400', (await call('POST', API + '?action=upsert-question',
     sampleQuestion('q-multi2', { qtype: 'multi', answer: [1, 1] }))).status, 400);
-  eq('简答题字符串答案', (await (await call('POST', '/functions/v1/app?action=upsert-question',
+  eq('简答题字符串答案', (await (await call('POST', API + '?action=upsert-question',
     sampleQuestion('q-short', { qtype: 'short', opts: [], answer: '参考答案要点若干。', explain_text: '答题思路' }))).json()).created, true);
 
-  eq('新增卡片', (await (await call('POST', '/functions/v1/app?action=upsert-card',
+  eq('新增卡片', (await (await call('POST', API + '?action=upsert-card',
     { id: 'c-one', subject: 'ana', chapter: '酸碱滴定法', front: '正面', back: '背面内容足够长', sort_order: null })).json()).created, true);
-  eq('新增章节', (await (await call('POST', '/functions/v1/app?action=upsert-chapter',
+  eq('新增章节', (await (await call('POST', API + '?action=upsert-chapter',
     { id: 'ch-one', subject: 'ana', name: '新章节', weight: 20, points: ['考点一', '考点二'], sort_order: null })).json()).created, true);
-  eq('章节权重越界 → 400', (await call('POST', '/functions/v1/app?action=upsert-chapter',
+  eq('章节权重越界 → 400', (await call('POST', API + '?action=upsert-chapter',
     { id: 'ch-bad', subject: 'ana', name: '新章节', weight: 200, points: [], sort_order: null })).status, 400);
 
-  eq('删除不存在的题 → 404', (await call('POST', '/functions/v1/app?action=delete-question', { id: 'q-nope' })).status, 404);
-  eq('删除已有题', await (await call('POST', '/functions/v1/app?action=delete-question', { id: 'q-one' })).json(),
+  eq('删除不存在的题 → 404', (await call('POST', API + '?action=delete-question', { id: 'q-nope' })).status, 404);
+  eq('删除已有题', await (await call('POST', API + '?action=delete-question', { id: 'q-one' })).json(),
     { id: 'q-one', deleted: true });
-  eq('删除时 id 非法 → 400', (await call('POST', '/functions/v1/app?action=delete-question', { id: 'X' })).status, 400);
-  eq('删除卡片', (await (await call('POST', '/functions/v1/app?action=delete-card', { id: 'c-one' })).json()).deleted, true);
-  eq('删除章节', (await (await call('POST', '/functions/v1/app?action=delete-chapter', { id: 'ch-one' })).json()).deleted, true);
+  eq('删除时 id 非法 → 400', (await call('POST', API + '?action=delete-question', { id: 'X' })).status, 400);
+  eq('删除卡片', (await (await call('POST', API + '?action=delete-card', { id: 'c-one' })).json()).deleted, true);
+  eq('删除章节', (await (await call('POST', API + '?action=delete-chapter', { id: 'ch-one' })).json()).deleted, true);
 
-  // 请求体解析
-  eq('畸形 JSON → 400', (await call('POST', '/functions/v1/app?action=upsert-question', '{not json')).status, 400);
-  eq('空请求体 → 400', (await call('POST', '/functions/v1/app?action=upsert-question', '')).status, 400);
-  eq('数组请求体 → 400', (await call('POST', '/functions/v1/app?action=upsert-question', '[]')).status, 400);
+  eq('畸形 JSON → 400', (await call('POST', API + '?action=upsert-question', '{not json')).status, 400);
+  eq('空请求体 → 400', (await call('POST', API + '?action=upsert-question', '')).status, 400);
+  eq('数组请求体 → 400', (await call('POST', API + '?action=upsert-question', '[]')).status, 400);
 
   // 一键上传（只插不改）
   const syncPayload = {
     questions: [sampleQuestion('q-sync-1', { sort_order: 0 }), sampleQuestion('q-sync-2', { sort_order: 1 })],
     cards: [{ id: 'c-sync', subject: 'bio', chapter: 'x', front: 'f', back: 'b', sort_order: 0 }],
   };
-  const sync1 = await (await call('POST', '/functions/v1/app?action=sync-builtin', syncPayload)).json();
+  const sync1 = await (await call('POST', API + '?action=sync-builtin', syncPayload)).json();
   eq('首次同步插入', sync1.results.map((r) => [r.table, r.inserted, r.skipped]),
     [['questions', 2, 0], ['cards', 1, 0]]);
   eq('首次同步未标记 incomplete', sync1.incomplete, false);
-  const sync2 = await (await call('POST', '/functions/v1/app?action=sync-builtin', syncPayload)).json();
+  const sync2 = await (await call('POST', API + '?action=sync-builtin', syncPayload)).json();
   eq('重复同步只跳过不覆盖', sync2.results.map((r) => [r.table, r.inserted, r.skipped]),
     [['questions', 0, 2], ['cards', 0, 1]]);
-  const dup = await (await call('POST', '/functions/v1/app?action=sync-builtin',
+  const dup = await (await call('POST', API + '?action=sync-builtin',
     { questions: [sampleQuestion('q-dup', { sort_order: 0 }), sampleQuestion('q-dup', { sort_order: 1 })] })).json();
   eq('同步内重复 id 被折叠', dup.results[0].duplicateIds, 1);
-  eq('同步空对象 → 400', (await call('POST', '/functions/v1/app?action=sync-builtin', {})).status, 400);
-  eq('同步超量 → 400', (await call('POST', '/functions/v1/app?action=sync-builtin',
+  eq('同步空对象 → 400', (await call('POST', API + '?action=sync-builtin', {})).status, 400);
+  eq('同步超量 → 400', (await call('POST', API + '?action=sync-builtin',
     { questions: Array.from({ length: 2001 }, (_, i) => sampleQuestion('q-x' + i, { sort_order: i })) })).status, 400);
-  eq('超量错误码', (await (await call('POST', '/functions/v1/app?action=sync-builtin',
+  eq('超量错误码', (await (await call('POST', API + '?action=sync-builtin',
     { questions: Array.from({ length: 2001 }, (_, i) => sampleQuestion('q-y' + i, { sort_order: i })) })).json()).error, 'too_many_records');
 
-  // 排序稳定性
-  bank = await (await call('GET', '/functions/v1/app?action=bank')).json();
+  bank = await (await call('GET', API + '?action=bank')).json();
   const orders = bank.questions.map((q) => q.sort_order);
   eq('bank 按 sort_order 升序', orders, orders.slice().sort((a, b) => a - b));
 
-  // 超大请求体
-  const huge = await call('POST', '/functions/v1/app?action=sync-builtin',
+  const huge = await call('POST', API + '?action=sync-builtin',
     JSON.stringify({ questions: [{ id: 'q-huge', stem: 'a'.repeat(4 * 1024 * 1024 + 10) }] }));
   eq('超过 4MB → 413', huge.status, 413);
   eq('413 错误码', (await huge.json()).error, 'payload_too_large');
@@ -218,13 +360,10 @@ const sampleQuestion = (id, over = {}) => ({
   await close(server);
 }
 
-/* ============ 第二阶段：真实种子数据灌入 ============ */
+/* ============ 第三阶段：真实种子数据灌入 ============ */
 {
   const db = createMemoryDb();
-  const auth = createAuth({ ADMIN_USER: USER, ADMIN_PASSWORD: PASS });
-  const server = createServer({ db, auth });
-  const port = await listen(server);
-  const base = 'http://127.0.0.1:' + port;
+  const { server, call } = await start(db);
 
   const content = await loadContent();
   eq('种子题目数', content.questions.length, 353);
@@ -242,8 +381,7 @@ const sampleQuestion = (id, over = {}) => ({
   eq('重复启动跳过灌入', again.skipped, true);
   eq('跳过后题目数不变', await db.count('questions'), 353);
 
-  const bankRes = await fetch(base + '/functions/v1/app?action=bank', { headers: { Authorization: GOOD } });
-  const bank = await bankRes.json();
+  const bank = await (await call('GET', API + '?action=bank')).json();
   eq('HTTP 读到的题目数', bank.questions.length, 353);
   eq('HTTP 读到的卡片数', bank.cards.length, 89);
   eq('HTTP 读到的章节数', bank.chapters.length, 32);
@@ -255,22 +393,17 @@ const sampleQuestion = (id, over = {}) => ({
   eq('各科题量', perSubject, { bio: 64, ana: 132, pol: 142, eng: 15 });
   eq('jsonb 字段已还原为对象/数组', Array.isArray(bank.questions[0].opts) && Array.isArray(bank.questions[0].tags), true);
 
-  // 灌入后启用后台，改一条内置题，确认编辑不会被下次启动覆盖
-  await fetch(base + '/functions/v1/app?action=claim-owner', { method: 'POST', headers: { Authorization: GOOD, 'Content-Type': 'application/json' }, body: '{}' });
+  // 改一条内置题，确认编辑不会被下次启动覆盖
   const target = bank.questions[0];
-  const editRes = await fetch(base + '/functions/v1/app?action=upsert-question', {
-    method: 'POST',
-    headers: { Authorization: GOOD, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      id: target.id, subject: target.subject, chapter: target.chapter, qtype: target.qtype,
-      level: target.level, tags: target.tags, stem: '我在后台改过的题干',
-      opts: target.opts, answer: target.answer, explain_text: target.explain_text,
-    }),
+  const editRes = await call('POST', API + '?action=upsert-question', {
+    id: target.id, subject: target.subject, chapter: target.chapter, qtype: target.qtype,
+    level: target.level, tags: target.tags, stem: '我在后台改过的题干',
+    opts: target.opts, answer: target.answer, explain_text: target.explain_text,
   });
   eq('编辑内置题成功', (await editRes.json()).created, false);
   const afterEdit = await seedIfEmpty(db, content, () => {});
   eq('重启灌入跳过，不覆盖后台编辑', afterEdit.skipped, true);
-  const reread = await (await fetch(base + '/functions/v1/app?action=bank', { headers: { Authorization: GOOD } })).json();
+  const reread = await (await call('GET', API + '?action=bank')).json();
   eq('后台编辑保留', reread.questions.find((q) => q.id === target.id).stem, '我在后台改过的题干');
 
   await close(server);

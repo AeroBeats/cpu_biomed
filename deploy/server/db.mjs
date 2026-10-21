@@ -22,12 +22,13 @@ const TABLES = {
   },
 };
 
-const OWNER_ROW = 'owner';
-
 // 测试替身（dev/memory-db.mjs）共用这份列定义，避免两边漂移。
 export const SELECT_COLUMNS = Object.fromEntries(
   Object.entries(TABLES).map(([table, spec]) => [table, spec.select.split(',')]),
 );
+
+// 账号表的列固定且短，不走上面的内容表白名单：它没有 sort_order / built_in 这套约定。
+const USER_SELECT = 'user_id, username, pass_hash, role, display_name';
 
 function spec(table) {
   const found = TABLES[table];
@@ -139,19 +140,49 @@ export function wrap(pool) {
       return new Set(rows.map((row) => row.id));
     },
 
-    async getOwner() {
+    /* ---- 账号与进度 ----
+       用户名一律存小写，由 auth 层在写入和查询前归一化。 */
+
+    async findUserByUsername(username) {
       const { rows } = await query(
-        'SELECT id, owner_id FROM site_settings WHERE id = $1 LIMIT 1', [OWNER_ROW]);
+        `SELECT ${USER_SELECT} FROM app_users WHERE username = $1 LIMIT 1`, [username]);
       return rows[0] || null;
     },
 
-    // 返回实际生效的 owner_id：并发抢占时以库里那一条为准。
-    async claimOwner(ownerId, now) {
-      await query(
-        `INSERT INTO site_settings (id, owner_id, updated_at) VALUES ($1, $2, $3)
-         ON CONFLICT (id) DO NOTHING`, [OWNER_ROW, ownerId, now]);
-      const row = await this.getOwner();
-      return row ? row.owner_id : null;
+    async findUser(userId) {
+      const { rows } = await query(
+        `SELECT ${USER_SELECT} FROM app_users WHERE user_id = $1 LIMIT 1`, [userId]);
+      return rows[0] || null;
+    },
+
+    // 用户名撞车时 ON CONFLICT DO NOTHING 返回 0 行，调用方据此报 username_taken。
+    async insertUser(row) {
+      const { rowCount } = await query(
+        `INSERT INTO app_users (user_id, username, pass_hash, role, display_name, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING`,
+        [row.user_id, row.username, row.pass_hash, row.role, row.display_name, row.created_at, row.updated_at]);
+      return rowCount > 0;
+    },
+
+    async setUserPassword(userId, passHash, now) {
+      const { rowCount } = await query(
+        'UPDATE app_users SET pass_hash = $1, updated_at = $2 WHERE user_id = $3',
+        [passHash, now, userId]);
+      return rowCount > 0;
+    },
+
+    async getProgress(userId) {
+      const { rows } = await query(
+        'SELECT data, updated_at FROM user_progress WHERE user_id = $1 LIMIT 1', [userId]);
+      return rows[0] || null;
+    },
+
+    async putProgress(userId, data, now) {
+      const { rowCount } = await query(
+        `INSERT INTO user_progress (user_id, data, updated_at) VALUES ($1, $2::jsonb, $3)
+         ON CONFLICT (user_id) DO UPDATE SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at`,
+        [userId, JSON.stringify(data), now]);
+      return rowCount > 0;
     },
   };
 }

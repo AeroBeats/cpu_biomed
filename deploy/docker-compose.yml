@@ -26,6 +26,8 @@ services:
       SITE_ROOT: /app/site
       ADMIN_USER: ${ADMIN_USER}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      # 留空则由服务从 ADMIN_PASSWORD 派生会话密钥
+      SESSION_SECRET: ${SESSION_SECRET:-}
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
     volumes:
       # 前端静态文件直接复用仓库里的 web/，改内容不用重新构建镜像
