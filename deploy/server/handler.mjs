@@ -3,7 +3,7 @@
    与冻结的 functions/handler.mjs 相比，这里是自建部署的唯一实现，差异有三处：
    1. 身份来自会话 Cookie（或 curl 用的 HTTP Basic），不是网关注入的用户上下文；
    2. 权限看 app_users.role，不再是 site_settings 里的单一所有者；
-   3. 多了 login / logout / register / session / progress 五个动作。 */
+   3. 多了 login / logout / register / session / progress / upload 六个动作。 */
 
 import {
   AppError, idOf, parseBody, questionRow, chapterRow, cardRow,
@@ -28,6 +28,7 @@ const METHODS = {
   'upsert-chapter': 'POST', 'delete-chapter': 'POST',
   'upsert-card': 'POST', 'delete-card': 'POST',
   'sync-builtin': 'POST',
+  upload: 'POST',
 };
 
 const TABLE_OF = {
@@ -200,7 +201,7 @@ async function handleProgress(ctx, db) {
   return json({ updated_at: now });
 }
 
-export async function handleBank(ctx, db, auth) {
+export async function handleBank(ctx, db, auth, media = null) {
   let action = '';
   try { action = new URL(ctx.url, 'http://internal').searchParams.get('action') || ''; } catch { action = ''; }
 
@@ -229,6 +230,20 @@ export async function handleBank(ctx, db, auth) {
 
     // 内容写入只有管理员能做；bank 的读取是公开的，浏览不需要登录。
     requireAdmin(ctx);
+
+    if (action === 'upload') {
+      // MEDIA_DIR 没配就是没打算存图，明确说清是不可用而不是静默失败。
+      if (!media) throw new AppError('upload_unavailable', 503);
+      const body = parseBody(ctx.bodyText);
+      try {
+        return json({ url: await media.save(body.data) });
+      } catch (e) {
+        // 落盘失败（没权限、磁盘满）不是数据库问题，别回 database_request_failed 误导人。
+        if (e instanceof AppError) throw e;
+        console.error('图片写入失败:', e instanceof Error ? e.message : e);
+        throw new AppError('upload_failed', 503);
+      }
+    }
 
     if (action.startsWith('delete-')) {
       const body = parseBody(ctx.bodyText);

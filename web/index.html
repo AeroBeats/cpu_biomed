@@ -10,6 +10,7 @@
 <meta property="og:description" content="338 生物化学 · 811 分析化学 · 101 思想政治理论 · 201 英语一，一站式初试备考工具。">
 <meta property="og:type" content="website">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2312313A'/%3E%3Cpath d='M11 7v7.2L7.6 21a2.6 2.6 0 0 0 2.3 3.9h12.2a2.6 2.6 0 0 0 2.3-3.9L21 14.2V7' fill='none' stroke='%2349B39E' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M10 7h12M9.4 19.5h13.2' stroke='%2349B39E' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="vendor/katex/katex.min.css">
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -67,6 +68,9 @@
 <script src="data/questions_extra.js"></script>
 <script src="data/cards_extra.js"></script>
 <script src="api.js"></script>
+<!-- 公式渲染放在本地，不走 CDN：服务器在国内，而且断网时题目也该能正常显示。 -->
+<script src="vendor/katex/katex.min.js"></script>
+<script src="vendor/katex/contrib/mhchem.min.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

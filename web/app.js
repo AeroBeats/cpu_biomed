@@ -54,7 +54,8 @@
     account: { mode: 'accounts', status: 'loading', user: null, form: 'login', busy: false, msg: null },
     // Qoder 站点：mode 'gateway'，身份由平台网关给，只有「站点所有者」这一个概念。
     owner: { status: 'loading' },          // loading | anon | unclaimed | owner | other | error
-    admin: { tab: 'questions', subject: 'bio', q: '', editing: null, busy: false, msg: null },
+    admin: { tab: 'questions', subject: 'bio', q: '', editing: null, busy: false, msg: null,
+             preview: false, imgBusy: false, importErrors: null },
     route: 'dashboard'
   };
 
@@ -66,8 +67,59 @@
       return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
     });
   }
+
+  /* ---------------- 富文本：公式 / 图片 / 加粗 ----------------
+     内容里认四种标记：$$…$$ 独立公式、$…$ 行内公式、![说明](地址) 图片、**加粗**。
+     其余字符一律转义，所以题库里写 <script> 只会显示成文字。
+     公式在这一步不渲染，只留一个带 data-tex 的占位元素，等进了 DOM 再交给 KaTeX——
+     这样 KaTeX 万一没加载成功，用户看到的是原始 TeX 而不是空白。 */
+  var RICH_TOKEN = /(\$\$[\s\S]+?\$\$|\$[^$\n]+?\$|!\[[^\]\n]*\]\([^)\s]+\)|\*\*[^*\n]+?\*\*)/g;
+  // 图片地址只放行 http(s) 和站内 /media/ 路径，挡掉 javascript: 之类的协议。
+  var IMG_SRC_OK = /^(https?:\/\/[^/\s]|\/media\/)/i;
+
   function rich(s) {
-    return esc(s).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    var src = String(s === null || s === undefined ? '' : s);
+    var out = '';
+    var last = 0;
+    var m;
+    RICH_TOKEN.lastIndex = 0;
+    while ((m = RICH_TOKEN.exec(src)) !== null) {
+      out += esc(src.slice(last, m.index)) + richToken(m[0]);
+      last = m.index + m[0].length;
+    }
+    return out + esc(src.slice(last));
+  }
+
+  function richToken(t) {
+    if (t.charAt(0) === '$') {
+      var display = t.charAt(1) === '$';
+      var tex = display ? t.slice(2, -2) : t.slice(1, -1);
+      if (!tex.trim()) return esc(t);
+      return '<span class="math' + (display ? ' math-block' : '') + '" data-tex="' + esc(tex) + '">' + esc(tex) + '</span>';
+    }
+    if (t.charAt(0) === '*') return '<strong>' + esc(t.slice(2, -2)) + '</strong>';
+    var im = /^!\[([^\]\n]*)\]\(([^)\s]+)\)$/.exec(t);
+    if (!IMG_SRC_OK.test(im[2])) return esc(t);   // 地址不合规就原样显示，不做成链接
+    return '<img class="shot" src="' + esc(im[2]) + '" alt="' + esc(im[1] || '题目配图') + '" loading="lazy">';
+  }
+
+  function paintMath(scope) {
+    if (!window.katex) return;
+    var nodes = (scope || document).querySelectorAll('.math[data-tex]:not([data-math-done])');
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      el.setAttribute('data-math-done', '1');
+      try {
+        window.katex.render(el.getAttribute('data-tex') || '', el, {
+          displayMode: el.className.indexOf('math-block') !== -1,
+          // TeX 写错也照样出东西（红字显示原文），不至于整题空掉。
+          throwOnError: false,
+          errorColor: '#C0392B',
+          strict: 'ignore',
+          trust: false          // 不许 \href 这类能塞外链的命令
+        });
+      } catch (e) { /* 渲染炸了就留着占位里的 TeX 原文当兜底 */ }
+    }
   }
   function today() {
     var d = new Date();
@@ -890,7 +942,7 @@
       body += '<div class="explain' + (res === true ? ' is-right' : ' is-wrong') + '">' +
         '<div class="explain-verdict">' +
         (res === true ? '✓ 回答正确' : '✗ 回答错误') +
-        '<span class="ans">正确答案 ' + esc(answerText(q)) + '</span>' +
+        '<span class="ans">正确答案 ' + rich(answerText(q)) + '</span>' +
         '</div>' +
         '<div class="explain-text">' + rich(q.explain) + '</div></div>';
     } else if (q.type !== 'short') {
@@ -1020,9 +1072,9 @@
         '</div></div>' +
         '<div class="q-item-stem">' + rich(q.stem) + '</div>' +
         '<details class="reveal"><summary>查看正确答案与解析</summary><div class="rev-body">' +
-        (q.type === 'short' ? '' : '<div style="margin-bottom:9px"><span class="rev-ans">' + esc(answerText(q)) + '</span></div>' +
+        (q.type === 'short' ? '' : '<div style="margin-bottom:9px"><span class="rev-ans">' + rich(answerText(q)) + '</span></div>' +
           (q.options ? '<div style="color:var(--ink-3);font-size:13px;margin-bottom:9px">' +
-            q.options.map(function (o, i) { return letter(i) + '. ' + esc(o); }).join('<br>') + '</div>' : '')) +
+            q.options.map(function (o, i) { return letter(i) + '. ' + rich(o); }).join('<br>') + '</div>' : '')) +
         (q.type === 'short' && q.answer ? '<div class="ra-label" style="font-size:11.5px;font-weight:700;color:var(--ink-3);letter-spacing:.06em;margin-bottom:6px">参考答案要点</div><div style="margin-bottom:10px">' + rich(q.answer) + '</div>' : '') +
         (q.explain ? '<div style="border-top:1px dashed var(--line-2);padding-top:10px">' + rich(q.explain) + '</div>' : '') +
         '</div></details></article>';
@@ -1667,6 +1719,142 @@
     if (countEl) countEl.textContent = rows.length + ' 条';
   }
 
+  /* 编辑器顶部的富文本工具条：选字段 → 插图片 / 看预览。
+     这里所有操作都直接改 DOM，绝不走 render()——编辑器的输入只在保存时才回写 state，
+     中途整页重绘会把用户正在打的字全部丢掉。 */
+  function markupTargets(d) {
+    if (d.kind === 'question') {
+      var t = [{ v: 'stem', label: '题干' }];
+      if (d.qtype !== 'blank' && d.qtype !== 'short') {
+        var slots = d.qtype === 'judge' ? 2 : (d.opts || []).length || 4;
+        for (var i = 0; i < slots; i++) t.push({ v: 'opt:' + i, label: '选项 ' + letter(i) });
+      }
+      t.push({ v: 'explain_text', label: '解析' });
+      if (d.qtype === 'blank' || d.qtype === 'short') t.push({ v: 'answer', label: '参考答案' });
+      return t;
+    }
+    if (d.kind === 'chapter') return [{ v: 'points', label: '考点清单' }];
+    return [{ v: 'front', label: '正面' }, { v: 'back', label: '背面' }];
+  }
+
+  function markupBar(d) {
+    var targets = markupTargets(d);
+    // 插图只有自建服务能用：Qoder 站点的 Function 没有 upload 动作，按钮摆出来也只会报错。
+    var canUpload = state.account.mode === 'accounts' && canWriteContent();
+    return '<div class="field markup-bar">' +
+      '<span class="field-label">公式 / 配图</span>' +
+      '<div class="row wrap" style="gap:8px;align-items:center">' +
+      '<select id="amTarget" aria-label="选择字段">' + targets.map(function (t) {
+        return '<option value="' + t.v + '">' + t.label + '</option>';
+      }).join('') + '</select>' +
+      (canUpload
+        ? '<button class="btn btn-sm" data-act="adm-img"' + (state.admin.imgBusy ? ' disabled' : '') + '>' +
+          (state.admin.imgBusy ? '上传中…' : '插入图片') + '</button>' +
+          '<input type="file" id="amFile" accept="image/png,image/jpeg,image/gif,image/webp" hidden>'
+        : '') +
+      '<button class="btn btn-sm btn-ghost" data-act="am-preview">' +
+      (state.admin.preview ? '收起预览' : '预览效果') + '</button>' +
+      '<span class="am-status" id="amStatus" role="status"></span>' +
+      '</div>' +
+      '<span class="f-help">支持 $E=mc^2$ 行内公式、$$…$$ 独立公式、$\\ce{H2SO4}$ 化学式、**加粗**；' +
+      '图片写成 ![说明](地址)，地址由「插入图片」自动生成。' +
+      (canUpload ? '' : '当前后端不支持插图，只能手写图片地址。') + '</span>' +
+      '<div id="amPreviewHost">' +
+      (state.admin.preview ? '<div class="markup-preview" id="admPreview"></div>' : '') +
+      '</div></div>';
+  }
+
+  function amStatus(text, bad) {
+    var el = document.getElementById('amStatus');
+    if (!el) return;
+    el.textContent = text || '';
+    el.className = 'am-status' + (bad ? ' is-err' : '');
+  }
+
+  // 'opt:2' 这种带下标的目标指向第 3 个选项输入框，其余就是普通的 data-f 名。
+  function amTargetEl(value) {
+    var box = document.getElementById('admEditor');
+    if (!box) return null;
+    var parts = String(value || '').split(':');
+    if (parts[0] === 'opt') {
+      var els = box.querySelectorAll('[data-f="opt"]');
+      return els[parseInt(parts[1], 10)] || null;
+    }
+    return box.querySelector('[data-f="' + parts[0] + '"]');
+  }
+
+  function amRefreshPreview() {
+    if (!state.admin.preview) return;
+    var box = document.getElementById('admPreview');
+    var sel = document.getElementById('amTarget');
+    if (!box || !sel) return;
+    var field = String(sel.value || '').split(':')[0];
+    var el = amTargetEl(sel.value);
+    var text = el ? el.value : '';
+    var html;
+    if (field === 'points') {
+      // 考点是一行一条、每条单独渲染的，预览也得按行来，跟实际显示一致。
+      html = text.split('\n').map(function (line) {
+        return line.trim() ? '<p class="mp-line">' + rich(line) + '</p>' : '';
+      }).join('');
+    } else if (field === 'opt') {
+      html = text.trim() ? '<p class="mp-line"><b>' + esc(letter(parseInt(String(sel.value).split(':')[1], 10))) +
+        '.</b> ' + rich(text) + '</p>' : '';
+    } else html = rich(text);
+    box.innerHTML = html.trim() ? html : '<p class="mp-empty">这个字段还没有内容。</p>';
+    paintMath(box);
+  }
+
+  var amPreviewQueued = false;
+  function amRefreshPreviewSoon() {
+    if (amPreviewQueued || !state.admin.preview) return;
+    amPreviewQueued = true;
+    setTimeout(function () { amPreviewQueued = false; amRefreshPreview(); }, 0);
+  }
+
+  function amTogglePreview() {
+    state.admin.preview = !state.admin.preview;
+    var host = document.getElementById('amPreviewHost');
+    var btn = document.querySelector('[data-act="am-preview"]');
+    if (btn) btn.textContent = state.admin.preview ? '收起预览' : '预览效果';
+    if (!host) return;
+    host.innerHTML = state.admin.preview ? '<div class="markup-preview" id="admPreview"></div>' : '';
+    amRefreshPreview();
+  }
+
+  function amInsertImage(file) {
+    var sel = document.getElementById('amTarget');
+    var el = amTargetEl(sel ? sel.value : 'stem');
+    var btn = document.querySelector('[data-act="adm-img"]');
+    if (!el) { amStatus('找不到要插入的输入框。', true); return; }
+    if (state.admin.imgBusy) return;
+    state.admin.imgBusy = true;
+    if (btn) { btn.disabled = true; btn.textContent = '上传中…'; }
+    amStatus('正在上传 ' + (file.name || '图片') + '…');
+    // 记住光标位置：上传是异步的，回来时焦点可能已经跑到别处了。
+    var at = el.selectionStart;
+    window.Cloud.uploadImage(file).then(function (url) {
+      var text = el.value || '';
+      var pos = typeof at === 'number' && at >= 0 && at <= text.length ? at : text.length;
+      var multi = el.tagName === 'TEXTAREA';
+      var snippet = multi ? '\n\n![配图](' + url + ')\n' : '![配图](' + url + ')';
+      el.value = text.slice(0, pos) + snippet + text.slice(pos);
+      try {
+        el.focus();
+        var caret = pos + snippet.length;
+        el.setSelectionRange(caret, caret);
+      } catch (e) { /* 定位不了光标就算了，内容已经插进去了 */ }
+      amRefreshPreview();
+      amStatus('已插入，别忘了点「保存到云端」。');
+    }, function (e) {
+      amStatus((e && e.message) || '图片上传失败。', true);
+    }).then(function () {
+      state.admin.imgBusy = false;
+      var b = document.querySelector('[data-act="adm-img"]');
+      if (b) { b.disabled = false; b.textContent = '插入图片'; }
+    });
+  }
+
   function admEditor() {
     var d = state.admin.editing;
     if (!d) return '';
@@ -1761,7 +1949,7 @@
       '<div class="card-head"><h2>' + (isNew ? '新建' : '编辑') +
       (d.kind === 'question' ? '题目' : d.kind === 'chapter' ? '考纲章节' : '背诵卡') + '</h2>' +
       (d.exists && d.built_in ? '<span class="hint">这是内置内容，保存后会变成你改过的版本</span>' : '') + '</div>' +
-      idField + subjectField + inner +
+      idField + subjectField + markupBar(d) + inner +
       '<div class="row wrap" style="gap:8px;margin-top:6px">' +
       '<button class="btn btn-primary" data-act="adm-save"' + (state.admin.busy ? ' disabled' : '') + '>' +
       (state.admin.busy ? '保存中…' : '保存到云端') + '</button>' +
@@ -1896,6 +2084,7 @@
       '<div class="card" style="margin-bottom:16px"><div class="card-head"><h2>管理权限</h2></div>' +
       manageCard + '</div>' +
       msg +
+      importErrorsCard() +
       (canWrite ? admEditor() : '') +
       '<div class="card">' + tabs + toolbar +
       (canWrite ? '' : '<p class="fey-note" style="margin-bottom:12px">' +
@@ -1961,9 +2150,12 @@
     if (id && !d.exists) { admMsg('err', '找不到编号为 ' + id + ' 的内容，可能已被删除。'); render(); return; }
     state.admin.editing = d;
     state.admin.msg = null;
+    state.admin.imgBusy = false;
     render();
     var box = document.getElementById('admEditor');
     if (box) box.scrollIntoView({ block: 'start' });
+    // 预览面板在换内容时保持开着，但里面的字得换成新这条的。
+    amRefreshPreview();
   }
 
   function admReadForm() {
@@ -2255,13 +2447,19 @@
     reader.readAsText(file);
   }
 
+  var ADM_KIND_LABEL = { question: '题目', chapter: '章节', card: '背诵卡' };
+
   // 分批并发提交，逐批报进度。失败只累计不中断，最后如实汇总。
+  // 但「失败 33 条」这种数字对改数据毫无帮助，所以每条失败的编号、字段和原因都记下来。
   function admRunImport(batch) {
     state.admin.busy = true;
-    var done = 0, failed = 0, unknown = 0;
+    state.admin.importErrors = null;
+    var done = 0, unknown = 0, fails = [];
     function finish() {
       state.admin.busy = false;
-      admMsg(failed ? 'err' : 'ok', '导入结束：成功 ' + done + ' 条，失败 ' + failed + ' 条。' +
+      state.admin.importErrors = fails.length ? fails : null;
+      admMsg(fails.length ? 'err' : 'ok', '导入结束：成功 ' + done + ' 条，失败 ' + fails.length + ' 条。' +
+        (fails.length ? '失败清单列在下面，改完那几条再导一次同一个文件即可。' : '') +
         (unknown ? '其中 ' + unknown + ' 条结果未知（网络中断），请先「重新读取云端」核对，再决定是否重跑失败的部分。' : ''));
       reloadCloud();
     }
@@ -2269,15 +2467,45 @@
       if (i >= batch.length) { finish(); return; }
       var group = batch.slice(i, i + ADM_BATCH);
       admMsgLive('info', '正在导入 ' + Math.min(i + ADM_BATCH, batch.length) + ' / ' + batch.length +
-        '（已成功 ' + done + '，失败 ' + failed + '）');
-      Promise.all(group.map(function (x) {
+        '（已成功 ' + done + '，失败 ' + fails.length + '）');
+      Promise.all(group.map(function (x, k) {
         return admApi(x.kind, 'up')(x.row).then(function () { done++; }, function (e) {
-          failed++;
           if (window.Cloud.isWriteOutcomeUnknown(e)) unknown++;
+          fails.push({
+            no: i + k + 1,
+            kind: ADM_KIND_LABEL[x.kind] || x.kind,
+            id: (x.row && x.row.id) || '（这一条没有编号）',
+            field: (e && e.field) || '',
+            text: (e && e.message) || '未知原因'
+          });
         });
       })).then(function () { step(i + ADM_BATCH); }, function () { step(i + ADM_BATCH); });
     }
     step(0);
+  }
+
+  var ADM_FAIL_SHOWN = 40;
+  function importErrorsCard() {
+    var list = state.admin.importErrors;
+    if (!list || !list.length) return '';
+    var shown = list.slice(0, ADM_FAIL_SHOWN);
+    return '<div class="card adm-import-errors">' +
+      '<div class="card-head"><h2>导入失败清单</h2><span class="hint">' + list.length + ' 条没写进云端</span></div>' +
+      '<p class="fey-note" style="margin-bottom:10px">改完这些条目再导一次同一个文件就行：已经成功的编号会按新内容更新，不会产生重复。' +
+      '想在导入前一次性找出所有问题，用离线体检脚本 <code>node deploy/tools/check-bank.mjs 你的文件.json</code>，' +
+      '它会逐条列出编号、字段和原因，还能查公式和图片的写法。</p>' +
+      '<ul class="ie-list">' + shown.map(function (f) {
+        return '<li><span class="ie-no">第 ' + f.no + ' 条</span>' +
+          '<b>' + esc(f.kind) + ' · ' + esc(f.id) + '</b>' +
+          (f.field ? '<code>' + esc(f.field) + '</code>' : '') +
+          '<span class="ie-why">' + esc(f.text) + '</span></li>';
+      }).join('') + '</ul>' +
+      (list.length > shown.length
+        ? '<p class="fey-note">只列出前 ' + ADM_FAIL_SHOWN + ' 条，还有 ' + (list.length - shown.length) +
+          ' 条没显示。这种情况建议改用上面的离线脚本，一次看全。</p>'
+        : '') +
+      '<button class="btn btn-sm btn-ghost" data-act="adm-import-clear" style="margin-top:10px">收起清单</button>' +
+      '</div>';
   }
 
   /* ---------------- 视图：账号 ----------------
@@ -2479,6 +2707,7 @@
     renderNav();
     renderCountdown();
     if (state.route === 'admin') renderAdminList();
+    paintMath(viewEl);
   }
 
   function navigate(r) {
@@ -2901,6 +3130,20 @@
         if (fi) { fi.value = ''; fi.click(); }
         break;
       }
+      case 'adm-import-clear':
+        state.admin.importErrors = null;
+        render();
+        break;
+      case 'adm-img': {
+        if (state.admin.imgBusy) break;
+        var imgInput = document.getElementById('amFile');
+        if (!imgInput) { amStatus('这个后端不支持插图。', true); break; }
+        amStatus('');
+        imgInput.value = '';
+        imgInput.click();
+        break;
+      }
+      case 'am-preview': amTogglePreview(); break;
 
       /* ---- 考纲 ---- */
       case 'kp': {
@@ -2963,7 +3206,14 @@
     // 题型和科目决定编辑器的其余控件长什么样，改了要整块重绘。
     if ((f === 'qtype' || f === 'subject') && document.getElementById('admEditor')) {
       var draft = admReadForm();
-      if (draft) { state.admin.editing = draft; render(); }
+      if (draft) { state.admin.editing = draft; render(); amRefreshPreview(); }
+    }
+    if (el.id === 'amTarget') { amRefreshPreview(); return; }
+    if (el.id === 'amFile') {
+      var img = el.files && el.files[0];
+      el.value = '';
+      if (img) amInsertImage(img);
+      return;
     }
   }
 
@@ -2987,6 +3237,9 @@
       renderAdminList();
       return;
     }
+    // 编辑器的字段改动只刷新预览，state 里的草稿仍是旧的（保存时统一读取）。
+    if (el.getAttribute && el.getAttribute('data-f') &&
+        el.closest && el.closest('#admEditor')) amRefreshPreviewSoon();
     var ss = state.session;
     if (!ss) return;
     if (b === 'blank' && ss.results[ss.idx] === null) {
@@ -3087,6 +3340,19 @@
 
   /* ---------------- 启动 ---------------- */
   viewEl = document.getElementById('view');
+  // 主视图的公式在 render() 末尾直接渲染；这里兜住弹窗、后台列表搜索这些
+  // 不经过 render() 的写入点，省得每处 innerHTML 后面都补一行。
+  // KaTeX 自己渲染时也会改 DOM，但那时节点已经打了 data-math-done，不会再进来。
+  // 用 setTimeout 而不是 requestAnimationFrame 合批：rAF 在页面不可见时不触发，
+  // 排队标志会一直卡住，等页面回到前台才补渲染；setTimeout 在后台也会跑。
+  if (window.MutationObserver) {
+    var mathQueued = false;
+    new MutationObserver(function () {
+      if (mathQueued) return;
+      mathQueued = true;
+      setTimeout(function () { mathQueued = false; paintMath(document); }, 0);
+    }).observe(document.body, { childList: true, subtree: true });
+  }
   document.getElementById('view').addEventListener('click', onClick);
   document.addEventListener('change', onChange);
   document.addEventListener('input', onInput);

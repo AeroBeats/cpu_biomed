@@ -200,6 +200,11 @@ rm -f "$APP_DIR/deploy/.env"          # 明文口令只留在 /etc/cpubiomed，�
 chown -R "$SERVICE_USER:$SERVICE_USER" "$APP_DIR"
 ok "web/ 与 deploy/ 已就位，副本里的 .env 已删除"
 
+# 题库配图目录：service 用户要能写，nginx（www-data）要能读，所以是 755 不是 750。
+# 单独建在 $APP_DIR 下而不是 web/ 里，上面那次整目录替换才不会把已上传的图删掉。
+install -d -m 755 -o "$SERVICE_USER" -g "$SERVICE_USER" "$APP_DIR/media"
+ok "配图目录 $APP_DIR/media 已就绪"
+
 cd "$APP_DIR/deploy/server"
 npm install --omit=dev --no-audit --no-fund --registry "$NPM_REGISTRY" >/dev/null
 chown -R "$SERVICE_USER:$SERVICE_USER" "$APP_DIR/deploy/server/node_modules"
@@ -212,6 +217,7 @@ install -d -m 750 -o root -g root "$ENV_DIR"
 PORT=8080
 HOST=127.0.0.1
 SITE_ROOT=$APP_DIR/web
+MEDIA_DIR=$APP_DIR/media
 DATABASE_URL=postgres://$DB_USER:$DB_PASS@127.0.0.1:5432/$DB_NAME
 ADMIN_USER=$ADMIN_USER
 ADMIN_PASSWORD=$ADMIN_PASS
@@ -231,13 +237,13 @@ systemctl restart "$SERVICE_NAME"
 ok "systemd 服务 $SERVICE_NAME 已启动并设为开机自启"
 
 if [ -d /etc/nginx/sites-enabled ]; then
-  sed "s|__HTTP_PORT__|$HTTP_PORT|g" "$SCRIPT_DIR/nginx-site.conf" \
-    > /etc/nginx/sites-available/$SERVICE_NAME
+  sed -e "s|__HTTP_PORT__|$HTTP_PORT|g" -e "s|__MEDIA_DIR__|$APP_DIR/media|g" \
+    "$SCRIPT_DIR/nginx-site.conf" > /etc/nginx/sites-available/$SERVICE_NAME
   ln -sf "/etc/nginx/sites-available/$SERVICE_NAME" "/etc/nginx/sites-enabled/$SERVICE_NAME"
   rm -f /etc/nginx/sites-enabled/default      # 它默认占着 80，会和站点冲突
 else
-  sed "s|__HTTP_PORT__|$HTTP_PORT|g" "$SCRIPT_DIR/nginx-site.conf" \
-    > "/etc/nginx/conf.d/$SERVICE_NAME.conf"
+  sed -e "s|__HTTP_PORT__|$HTTP_PORT|g" -e "s|__MEDIA_DIR__|$APP_DIR/media|g" \
+    "$SCRIPT_DIR/nginx-site.conf" > "/etc/nginx/conf.d/$SERVICE_NAME.conf"
   rm -f /etc/nginx/conf.d/default.conf
 fi
 nginx -t >/dev/null
@@ -275,6 +281,21 @@ ADMIN_ROLE=$(as_postgres psql -tA -d "$DB_NAME" -c \
 [ "$ADMIN_ROLE" = admin ] || die "管理员账号 $ADMIN_USER 没有落库（当前：${ADMIN_ROLE:-查不到}），
     看 journalctl -u $SERVICE_NAME -n 30"
 ok "管理员账号 $ADMIN_USER 已落库，角色 admin"
+
+# 图片上传链路：MEDIA_DIR 可写 + nginx 的 /media/ alias 指向同一个目录。
+# 这两处权限配错的话，后台插图要等到真去用的时候才炸，不如现在先试一次。
+PNG_B64='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+UPLOAD=$(curl -s --max-time 15 -u "$ADMIN_USER:$ADMIN_PASS" \
+  -H 'Content-Type: application/json' -d "{\"data\":\"$PNG_B64\"}" \
+  "http://127.0.0.1:$HTTP_PORT/functions/v1/app?action=upload" || echo '')
+MEDIA_URL=$(printf '%s' "$UPLOAD" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{console.log(JSON.parse(s).url||"")}catch(e){console.log("")}});')
+[ -n "$MEDIA_URL" ] || die "图片上传失败，接口返回：${UPLOAD:-无响应}
+    多半是 $APP_DIR/media 不可写，看 journalctl -u $SERVICE_NAME -n 30"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://127.0.0.1:$HTTP_PORT$MEDIA_URL")
+[ "$CODE" = 200 ] || die "刚上传的图取不回来（$MEDIA_URL 返回 $CODE），
+    检查 nginx 的 /media/ alias 是否指向 $APP_DIR/media"
+rm -f "$APP_DIR/media/${MEDIA_URL#/media/}"      # 自检用的 1x1 像素图，验完就删
+ok "图片上传与读取正常"
 
 BANK=$(curl -fsS --max-time 30 -u "$ADMIN_USER:$ADMIN_PASS" \
   "http://127.0.0.1:$HTTP_PORT/functions/v1/app?action=bank" || echo '')

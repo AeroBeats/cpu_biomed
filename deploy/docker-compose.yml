@@ -10,6 +10,8 @@ services:
       # - "443:443"
     volumes:
       - ./nginx/site.conf:/etc/nginx/conf.d/default.conf:ro
+      # 题库配图由 nginx 直接发，不经过 api（只读挂载，nginx 改不了图）
+      - mediadata:/var/www/media:ro
       # - /etc/letsencrypt:/etc/letsencrypt:ro
       # - ./nginx/certbot:/var/www/certbot:ro
     depends_on:
@@ -24,6 +26,8 @@ services:
     environment:
       PORT: "8080"
       SITE_ROOT: /app/site
+      # 题库配图的存放位置，nginx 以只读方式挂同一个卷来对外发图
+      MEDIA_DIR: /app/media
       ADMIN_USER: ${ADMIN_USER}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD}
       # 留空则由服务从 ADMIN_PASSWORD 派生会话密钥
@@ -32,6 +36,8 @@ services:
     volumes:
       # 前端静态文件直接复用仓库里的 web/，改内容不用重新构建镜像
       - ../web:/app/site:ro
+      # 配图要能写，所以是独立的可写卷，跟着备份走
+      - mediadata:/app/media
     depends_on:
       db:
         condition: service_healthy
@@ -64,6 +70,7 @@ services:
 
 volumes:
   dbdata:
+  mediadata:
 
 networks:
   front:

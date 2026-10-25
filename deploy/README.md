@@ -27,6 +27,7 @@ Qoder 站点保留但不再更新，作为回退备份。
 | 数据库 | 平台托管的 PostgreSQL（`app` schema） | 你自己的 PostgreSQL（`public` schema），容器或系统服务均可 |
 | 访问控制 | 站点设为私有，只有受邀者能进 | 页面和题库**公开可读**；只有「同步进度」「改内容」需要登录 |
 | 学习进度 | 存在浏览器 localStorage，绑定 qoder.website 域名 | localStorage 为主，登录后再往服务器备一份快照，可跨设备找回 |
+| 公式与配图 | 纯文本（那一侧已冻结，没有渲染公式的能力） | `$…$` / `$$…$$` / `\ce{}` 由自托管 KaTeX 渲染，管理员可在后台直接插图 |
 
 **登录不是进站门槛。** 浏览、刷题、背卡片全都不需要账号；只有在「想把进度带到别的设备」
 或「要改题库内容」时才需要登录。登录之后进度会自动同步到服务器，换设备登录同一个账号就能接着做。
@@ -51,14 +52,20 @@ deploy/
 │   ├── cpubiomed.service   systemd 服务单元模板
 │   └── nginx-site.conf     反向代理配置，upstream 指向 127.0.0.1:8080
 ├── server/                 Node 服务（认证 / 静态托管 / 题库接口 / 首启灌入），两条路线共用
-│   └── content.json        种子数据，由 tools/build-seed.mjs 生成
+│   ├── content.json        种子数据，由 tools/build-seed.mjs 生成
+│   └── media.mjs           配图存储：文件头判类型、限 2 MB、拒 SVG
 ├── tools/
 │   ├── build-seed.mjs      从 web/data 重新生成 content.json
+│   ├── bank-template.json  批量导入模板，含公式与图片写法说明，照抄改内容即可
+│   ├── check-bank.mjs      离线体检：导入前逐条报出编号、字段和原因
 │   ├── export-from-qoder.js  在 Qoder 站点控制台里运行，导出云端题库 + 进度
 │   ├── import-bundle.mjs   把导出文件转成 content.json 和进度恢复脚本
 │   └── fix-docker-mirror.sh  【Docker 路线】探测可用的镜像加速器
 └── migrate/                导出/恢复用的中间文件（运行工具后生成）
 ```
+
+服务器上还有两个数据目录，**它们不在代码仓库里，备份时必须单独带上**（见第 9 节）：
+PostgreSQL 数据本身，以及配图目录（原生部署 `/opt/cpubiomed/media`，Docker 的 `mediadata` 卷）。
 
 ---
 
@@ -226,6 +233,10 @@ nano .env
   代价是日后改管理员口令会让所有人重新登录一次。填了它，改口令就不影响已登录的会话。
 - `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` —— 数据库口令，只在容器内网用，你不会直接碰。
 - `HTTP_PORT` —— 对外端口，默认 80。
+- `MEDIA_DIR` —— **不用填**。题库配图的存放目录两条路线都已经写死了：原生部署由
+  `install.sh` 建成 `/opt/cpubiomed/media`，Docker 用 `mediadata` 卷挂到容器内 `/app/media`。
+  只有手动 `node deploy/server/index.mjs` 起服务时才需要自己 `export MEDIA_DIR=/某个可写目录`；
+  不设也能启动，只是插图接口会回 `upload_unavailable`。
 
 普通用户不需要你建账号：站点上的注册是开放的（`#/account` 页），注册进来就是 `role = user`，
 只能同步自己的学习进度，碰不到题库内容。要把某人提成管理员，在数据库里改 `app_users.role`
@@ -274,6 +285,13 @@ sudo systemctl restart cpubiomed                 # 改了 deploy/server/ 下的�
 - [ ] 登录后左下角变成头像 + 用户名 + 「管理员」，导航里**自动多出「内容管理」**
 - [ ] 「内容管理」直接就是编辑界面（自建部署不需要「启用后台管理」那一步，那是 Qoder 站点才有的）
 - [ ] 在后台新增一道测试题 → 刷新页面 → 题还在 → 删掉它
+- [ ] 测试题的题干里写 `$K_m$ 与 $\ce{H2SO4}$`，保存后到「刷题训练」里做这道题：
+      公式排成了数学字体，不是原样的 `$…$`（KaTeX 是本地文件，不联网也要能显示）
+- [ ] 后台编辑器顶部有「公式 / 配图」工具条 → 选中「题干」→「插入图片」选一张 png →
+      输入框里自动出现 `![配图](/media/<年月>/<文件名>.png)`；点「预览效果」能看到渲染结果
+- [ ] 浏览器直接打开刚才那个 `/media/…` 地址，图片能显示
+- [ ] 后台「导入 JSON」选 `deploy/tools/bank-template.json` → 提示成功 8 条 →
+      刷新后能看到 `demo-` 开头的那几道题（看完记得删掉）
 - [ ] 登录状态下做完一组题，等几秒（改动有 3 秒防抖），左下角从「正在同步进度…」
       变成「进度已同步到服务器 · 时间」
 - [ ] 「账号」页 → 点「从服务器恢复」→ 进度对得上
@@ -297,7 +315,7 @@ curl -s -u "$ADMIN_USER:$ADMIN_PASSWORD" 'http://localhost/functions/v1/app?acti
 
 ---
 
-## 7. 把云端数据和学习进度带过来
+## 7. 内容与数据：搬过来、批量加进去
 
 ### 7a. 学习进度（刷题记录、错题本、卡片进度、打卡天数）
 
@@ -362,6 +380,73 @@ sudo systemctl restart cpubiomed
 
 ---
 
+### 7c. 批量加题：模板 + 离线体检 + 后台导入
+
+后台一条一条手输适合零散补题。要一次加几十上百条（比如把一本习题册录进去），走这三步：
+
+**1. 照模板写 JSON。** 模板在 `deploy/tools/bank-template.json`，里面有 6 道示例题
+（覆盖单选/多选/判断/填空/简答全部五种题型）、1 个章节、1 张背诵卡，全部通过体检。
+开头三段 `_说明` /
+`_字段说明` / `_公式与图片写法` 就是给你看的注释，`_` 开头的键导入时会被忽略，
+不用删。复制一份改名，把示例内容换掉即可。
+
+**2. 导入前先在本地体检一遍。**
+
+```bash
+node deploy/tools/check-bank.mjs 我的题库.json
+node deploy/tools/check-bank.mjs 我的题库.json --strict      # 警告也算不通过
+node deploy/tools/check-bank.mjs 我的题库.json --json        # 机器可读，警告全量输出
+node deploy/tools/check-bank.mjs 我的题库.json --no-builtin  # 不检查是否覆盖内置题
+```
+
+它用的是 `deploy/server/validate.mjs` 里**同一份规则**（直接 import，不是抄一遍），
+所以「这里通过」就等于「接口会收下」。除了接口会拒的错误，它还会提醒几类
+接口不管、但会让你白忙一场的写法：字段名拼错（`explain` 应写 `explain_text`）、
+编号重复、编号撞上内置题（**导入是整条覆盖，不是合并**）、`$` 落单没配对、
+`\ce{}` 写在公式外面、图片地址不在允许的前缀里、`demo-` 示例编号忘了改。
+退出码：0 = 可以导入，1 = 有错误，2 = 文件读不了或不是合法 JSON。
+
+**3. 后台「导入 JSON」。** 用管理员账号登录 → 内容管理 → 导入 JSON → 选文件。
+它会分批提交并实时显示进度；万一还有条目被拒，界面会列出**失败清单**：
+第几条、什么类型、编号、哪个字段、什么原因。照着改那几条，再导一次同一个文件就行
+——已经成功的编号会按新内容更新，不会产生重复。
+
+> **编号规则**：3–64 位，只能是小写字母、数字和短横线，且以字母或数字开头。
+> 建议用「科目-章节-序号」这种能看懂的形式（`ana-ch3-014`），日后翻数据库好认。
+> **长度按字节算**，一个汉字算 3 字节：题干上限 4000 字节 ≈ 1300 个汉字。
+
+#### 公式与配图的写法
+
+题干、选项、解析、参考答案、背诵卡正反面、考点清单都支持同一套标记，
+由自托管的 KaTeX + mhchem 渲染（`web/vendor/katex/`，不走 CDN，服务器不联网也能显示）：
+
+| 想要的效果 | 写法 |
+| --- | --- |
+| 行内公式 | `$K_m$`、`$\Delta G^\circ = -RT\ln K$` |
+| 独立成行的公式 | `$$[\ce{H+}] = \sqrt{K_a c}$$` |
+| 化学式 / 化学方程式 | `$\ce{H2SO4}$`、`$\ce{CH3COOH + H2O <=> CH3COO- + H3O+}$`（`\ce{}` 必须写在 `$` 里面） |
+| 加粗 | `**这是重点**` |
+| 图片 | `![说明文字](/media/202610/abc123.png)`，或完整的 `https://…` 地址 |
+
+写错的公式**不会让页面白屏**：KaTeX 渲染失败时原样显示 TeX 源码，
+所以看到一串 `$\frac{a}{b$` 就说明那个字段的 `$` 没配对。
+不支持 LaTeX 的 `\includegraphics`、`\usepackage`、`tabular` 环境——
+表格请用图片，或者拆成几行文字。
+
+**配图从哪来：** 后台编辑器顶部有「公式 / 配图」工具条，选一个字段（题干 / 选项 A /
+解析 / 背诵卡背面…）→「插入图片」选文件，上传完地址会自动写进那个字段的光标处；
+「预览效果」按真实渲染的样子排版，公式和图片都能当场看到。
+单张上限 2 MB，只收 png / jpg / gif / webp——**SVG 一律拒收**，它能内嵌脚本，
+和页面同源就等于给了永久 XSS。
+
+批量导入的 JSON 里只能写图片**地址**，图片文件本身不在 JSON 里。所以要么先在后台
+一张张上传拿到地址，要么把文件直接放进服务器的配图目录（原生部署
+`/opt/cpubiomed/media/<YYYYMM>/`，Docker 是 `mediadata` 卷），地址按
+`/media/<YYYYMM>/<文件名>` 写。**换服务器或恢复备份时必须把这个目录一起带上**，
+否则题目文字都在、图片全 404，详见第 9 节。
+
+---
+
 ## 8. HTTPS（建议做）
 
 现在是明文 HTTP，**登录口令和会话 Cookie 在网络上都是可被窃听的**——拿到 Cookie 就等于
@@ -418,8 +503,12 @@ docker compose up -d --build api    # 改了 package.json 或 content.json 后
 # 备份数据库（建议配个 cron，每天一份，留最近 14 天）
 docker compose exec -T db pg_dump -U cpubiomed -d cpubiomed | gzip > backup-$(date +%F).sql.gz
 
+# 备份题库配图（数据库里只存地址，图片文件在 mediadata 卷里，必须单独带）
+docker compose cp api:/app/media ./media-$(date +%F)
+
 # 恢复
 gunzip -c backup-2026-10-16.sql.gz | docker compose exec -T db psql -U cpubiomed -d cpubiomed
+docker compose cp ./media-2026-10-16/. api:/app/media/
 ```
 
 原生部署（第 3c 节）的对应命令：
@@ -433,16 +522,27 @@ cd ~/cpubiomed && sudo bash deploy/native/install.sh   # 改了 package.json / c
 # 备份数据库（建议配个 cron，每天一份，留最近 14 天）
 sudo -u postgres pg_dump cpubiomed | gzip > backup-$(date +%F).sql.gz
 
+# 备份题库配图
+sudo tar czf media-$(date +%F).tar.gz -C /opt/cpubiomed media
+
 # 恢复
 gunzip -c backup-2026-10-19.sql.gz | sudo -u postgres psql cpubiomed
+sudo tar xzf media-2026-10-19.tar.gz -C /opt/cpubiomed
 ```
+
+> **`pg_dump` 不再等于完整备份。** 加了配图功能之后，一份完整备份是三样东西：
+> 数据库导出（题库文字 + 账号 + 进度）、配图目录（`/opt/cpubiomed/media` 或
+> `mediadata` 卷）、以及 `deploy/.env`（口令和 `SESSION_SECRET`，丢了就登不进去）。
+> 只恢复数据库的话，题目文字都在，但里面引用的图片会全部 404。
+> 配图目录只增不改，所以不用每天都全量备份——隔几天做一次、或者只在批量插图之后做一次也够。
 
 **改前端内容**（`web/` 下的文件）：Docker 路线下 `web/` 是只读挂载进容器的，改完刷新页面
 就生效；原生路线下 `web/` 是复制到 `/opt/cpubiomed/web` 的，要重跑一次 `install.sh`
 （或直接覆盖那个目录下的文件）。两条路都不用碰数据库。
 
-**加题目**有两条路：
-- 在网站的「内容管理」里手动加 —— 立即生效，只进数据库；
+**加题目**有三条路：
+- 在网站的「内容管理」里手动加 —— 立即生效，只进数据库；一次加几条时用这个；
+- **批量导入 JSON** —— 一次几十上百条走这条，模板、离线体检脚本和公式/配图写法见第 7c 节；
 - 改 `web/data/questions_extra.js` 之类的内容文件 —— 静态兜底数据变了，但**数据库不会自动跟着变**，
   需要在「内容管理」里点一次「一键上传」（只插不改，不会覆盖你已有的编辑）。
 
@@ -506,13 +606,24 @@ Qoder 站点还在，随时可以用 https://cpu-biomed-q1r9t5025uh.qoder.websit
 
 ## 11. 需要你知道的边界
 
-- **本地验证做到哪一步**：接口逻辑用内存数据库替身跑过 158 项断言（注册/登录/会话签名、
+- **本地验证做到哪一步**：接口逻辑用内存数据库替身跑过 204 项断言（注册/登录/会话签名、
   角色权限、HTTP Basic 兜底、路径穿越防护、全部 action、全部字段校验、进度快照读写与 1 MB 上限、
-  353 条真实种子数据灌入、幂等性、后台编辑不被覆盖），全部通过；前端也开着真浏览器把
+  353 条真实种子数据灌入、幂等性、后台编辑不被覆盖、图片上传的类型/大小/SVG 拒收与
+  `/media/` 托管、离线体检脚本与导入模板自身），全部通过；前端也开着真浏览器把
   匿名浏览 → 注册 → 角色化导航 → 非管理员锁定页 → 管理员改题库 → 做完题后的登录提示 →
   清空 localStorage 后从服务器找回进度这条链子整个走了一遍。
+  这一轮新加的富文本部分同样是**真浏览器实测**：后台工具条插图 → 上传 → 地址写回输入框 →
+  保存 → `?action=bank` 原样返回 → 刷题页、判分那行、解析面板、错题本的展开区都渲染出
+  KaTeX 与 `\ce{}` 化学式，图片取回 200。
   **但没有在真实 PostgreSQL / 真实 nginx 上跑过**，本机既没装 Docker 也没有 Linux 环境。
   第 6 节的验证清单第一次在服务器上执行时，才是真正的端到端确认。
+- **公式渲染是 KaTeX，不是完整 LaTeX**：常用数学符号、上下标、分式、根号、矩阵、
+  `\ce{}` 化学式都能排；`\includegraphics`、`\usepackage`、`tabular`、tikz 这类不行。
+  排版细节（比如某些宏包的间距）和 Word/LaTeX 编译出来的样子会有出入。
+  写错的公式**不会白屏**，会原样显示 TeX 源码——看到页面上一串 `$…$` 就是那里写错了。
+- **配图只存文件路径，不进数据库**：JSON 导入不会上传图片，题库里的 `/media/…`
+  地址指向服务器磁盘上的文件。所以备份、换服务器、恢复旧库时，配图目录必须一起带走
+  （第 9 节），否则文字都在、图全 404。
 - **原生安装脚本 `deploy/native/install.sh` 同样没有实机跑过**。本机验证到的是：
   bash 语法检查通过；`.env` 解析与 15 组输入逐个实测（10 组应被拦下的：模板占位文字、
   口令过短、base64 特殊字符、缺字段、非数字端口、用户名带空格、库名含引号或分号、

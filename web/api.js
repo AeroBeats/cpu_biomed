@@ -14,6 +14,8 @@ window.Cloud = (function () {
 
   var FN = '/functions/v1/app';
   var SUBJECTS = ['bio', 'ana', 'pol', 'eng'];
+  // 与 deploy/server/media.mjs 的 MAX_IMAGE_BYTES 保持一致；改一边就得改另一边。
+  var MAX_IMAGE_BYTES = 2 * 1024 * 1024;
 
   // 内置数据快照：api.js 在数据脚本之后、app.js 之前加载，
   // 此处固定引用，之后 window.QB 被云端数据替换也不受影响。
@@ -37,6 +39,10 @@ window.Cloud = (function () {
     username_taken: '这个用户名已经被占用，换一个吧。',
     not_admin: '当前账号没有管理权限，只能浏览内容和同步自己的进度。',
     progress_too_large: '进度数据太大，无法同步到服务器。',
+    image_too_large: '图片超过 2 MB，请先压一压再上传。',
+    unsupported_image: '只收 png / jpg / gif / webp 四种位图，SVG 和 PDF 都不行。',
+    upload_unavailable: '服务器没有开启图片存储（未配置 MEDIA_DIR），暂时无法插图。',
+    upload_failed: '图片写入服务器失败，可能是磁盘满了或目录没有写权限。',
     invalid_user_context: '登录状态校验失败，请刷新页面后重试。',
     owner_not_claimed: '还没有启用后台管理，请先点击「启用后台管理」。',
     owner_exists: '后台管理已由其他账号启用，当前账号无法修改题库。',
@@ -246,8 +252,27 @@ window.Cloud = (function () {
         return true;
       } catch (e) { return false; }
     },
-    ownerState: function () { return get('owner'); },
-    claimOwner: function () { return post('claim-owner', {}); },
+    /* 插图：把文件读成 data URL 交给后端，后端按文件头判类型、生成随机文件名落盘，
+       回一个 /media/… 的相对路径，直接写进题目内容里就能用。
+       大小在本地先卡一道——超了也传不上去，白等一轮往返不如立刻说清。 */
+    uploadImage: function (file) {
+      return new Promise(function (resolve, reject) {
+        if (!file) { reject(ApiError(MESSAGES.invalid_request, 'invalid_request')); return; }
+        if (file.size > MAX_IMAGE_BYTES) {
+          reject(ApiError(MESSAGES.image_too_large, 'image_too_large')); return;
+        }
+        var reader = new FileReader();
+        reader.onerror = function () { reject(ApiError('这张图读不出来，可能已经损坏，换一张试试。', 'read_failed')); };
+        reader.onload = function () {
+          post('upload', { data: String(reader.result) }).then(function (res) {
+            if (res && typeof res.url === 'string') resolve(res.url);
+            else reject(ApiError(MESSAGES.upload_failed, 'upload_failed'));
+          }, reject);
+        };
+        reader.readAsDataURL(file);
+      });
+    },
+    ownerState: function () { return get('owner'); },    claimOwner: function () { return post('claim-owner', {}); },
     syncBuiltin: function () { return post('sync-builtin', flattenBuiltin()); },
     upsertQuestion: function (row) { return post('upsert-question', row); },
     deleteQuestion: function (id) { return post('delete-question', { id: id }); },

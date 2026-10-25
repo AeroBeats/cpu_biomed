@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { createDb } from './db.mjs';
 import { createAuth, verifyPassword, SESSION_COOKIE } from './auth.mjs';
 import { handleBank } from './handler.mjs';
+import { createMediaStore } from './media.mjs';
 import { AppError } from './validate.mjs';
 import { loadContent, seedIfEmpty } from './seed.mjs';
 
@@ -19,6 +20,8 @@ const PORT = Number(process.env.PORT || 8080);
 // 原生部署时设成 127.0.0.1，让题库接口只能经 nginx 到达；容器部署不发布端口，保持默认即可。
 const HOST = process.env.HOST || '0.0.0.0';
 const SITE_ROOT = path.resolve(process.env.SITE_ROOT || '../../web');
+// 留空表示不存图：上传接口会明确回 upload_unavailable，而不是把文件悄悄丢进代码目录。
+const MEDIA_DIR = (process.env.MEDIA_DIR || '').trim();
 const API_PATH = '/functions/v1/app';
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
 const DB_RETRY_MS = 2000;
@@ -33,6 +36,10 @@ const MIME = {
   '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
   '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
   '.woff2': 'font/woff2',
 };
 
@@ -100,8 +107,27 @@ async function serveStatic(req, res, urlPath) {
   send(res, 200, { 'content-type': type, 'cache-control': 'no-cache', 'content-length': file.length }, file);
 }
 
-function parseCookies(header) {
-  const out = {};
+// 生产环境这一段由 nginx 直接发（更快，也不占 Node 的连接）；
+// 这里留着是为了本地预览和没配反代时图片照样能显示。
+async function serveMedia(req, res, media, urlPath) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    return send(res, 405, { allow: 'GET, HEAD', 'content-type': 'text/plain; charset=utf-8' }, '方法不允许');
+  }
+  const target = media.resolve(urlPath.slice('/media'.length));
+  if (!target) return send(res, 404, { 'content-type': 'text/plain; charset=utf-8' }, '未找到');
+  let info;
+  try { info = await stat(target); } catch { return send(res, 404, { 'content-type': 'text/plain; charset=utf-8' }, '未找到'); }
+  if (!info.isFile()) return send(res, 404, { 'content-type': 'text/plain; charset=utf-8' }, '未找到');
+  const file = await readFile(target);
+  // 文件名是随机十六进制，内容不会变，所以可以放心长缓存。
+  send(res, 200, {
+    'content-type': MIME[path.extname(target).toLowerCase()] || 'application/octet-stream',
+    'cache-control': 'public, max-age=31536000, immutable',
+    'content-length': file.length,
+  }, file);
+}
+
+function parseCookies(header) {  const out = {};
   if (typeof header !== 'string') return out;
   for (const part of header.split(';')) {
     const idx = part.indexOf('=');
@@ -140,7 +166,7 @@ async function resolveUser(req, db, auth) {
   return null;
 }
 
-export function createServer({ db, auth }) {
+export function createServer({ db, auth, media = null }) {
   return http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://internal');
 
@@ -153,6 +179,10 @@ export function createServer({ db, auth }) {
       }
     }
 
+    if (media && url.pathname.startsWith('/media/')) {
+      return await serveMedia(req, res, media, url.pathname);
+    }
+
     const user = await resolveUser(req, db, auth);
 
     try {
@@ -160,7 +190,7 @@ export function createServer({ db, auth }) {
         let bodyText = '';
         if (req.method === 'POST') bodyText = await readBody(req);
         const result = await handleBank(
-          { method: req.method, url: req.url, user, bodyText, secure: isSecure(req) }, db, auth);
+          { method: req.method, url: req.url, user, bodyText, secure: isSecure(req) }, db, auth, media);
         return sendJson(res, result.status, result.body, result.headers);
       }
       return await serveStatic(req, res, url.pathname);
@@ -203,6 +233,9 @@ async function main() {
 
   const db = await createDb(process.env.DATABASE_URL);
   const ready = await waitForDb(db);
+  // 图片存储跟数据库无关，库连不上也照样能建目录。
+  const media = MEDIA_DIR ? createMediaStore(MEDIA_DIR) : null;
+  if (!media) console.warn('未设置 MEDIA_DIR，后台插图功能不可用（上传会回 upload_unavailable）');
 
   if (ready) {
     // 灌入失败不阻止启动：前端拿不到云端数据时会自动回落到内置 JS 数据。
@@ -222,7 +255,7 @@ async function main() {
     console.error('数据库不可用，仍继续启动：页面可访问，题库接口会回落到前端内置数据，登录不可用');
   }
 
-  const server = createServer({ db, auth });
+  const server = createServer({ db, auth, media });
   server.listen(PORT, HOST, () => console.log(`复习台服务已启动，监听 ${HOST}:${PORT}，静态目录 ${SITE_ROOT}`));
 
   const shutdown = () => {

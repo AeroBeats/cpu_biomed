@@ -1,9 +1,12 @@
 /* 自建后端本地验证：node dev/check-selfhost.mjs
    用内存数据库替身跑通账号会话、静态托管、全部 action 与校验规则，
    并把 deploy/server/content.json 整份灌一遍，确认 353 条种子数据都能通过校验。
+   最后一阶段用同一份规则反过来体检导入模板和离线脚本本身。
    不需要 Docker、不需要 pg、不需要联网。 */
 
 import path from 'node:path';
+import os from 'node:os';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -13,6 +16,7 @@ process.env.SITE_ROOT = path.join(ROOT, 'web');
 const { createServer } = await import('../deploy/server/index.mjs');
 const { createAuth, hashPassword, verifyPassword, SESSION_COOKIE } = await import('../deploy/server/auth.mjs');
 const { loadContent, seedIfEmpty } = await import('../deploy/server/seed.mjs');
+const { createMediaStore, detectImage, MAX_IMAGE_BYTES } = await import('../deploy/server/media.mjs');
 const { createMemoryDb } = await import('./memory-db.mjs');
 
 const USER = 'owner';
@@ -47,10 +51,10 @@ function request(base, method, url, body, headers) {
   });
 }
 
-async function start(db, env = { ADMIN_USER: USER, ADMIN_PASSWORD: PASS }) {
+async function start(db, env = { ADMIN_USER: USER, ADMIN_PASSWORD: PASS }, media = null) {
   const auth = createAuth(env);
   const boot = await auth.ensureAdmin(db);
-  const server = createServer({ db, auth });
+  const server = createServer({ db, auth, media });
   const port = await listen(server);
   const base = 'http://127.0.0.1:' + port;
   return {
@@ -407,6 +411,128 @@ const sampleQuestion = (id, over = {}) => ({
   eq('后台编辑保留', reread.questions.find((q) => q.id === target.id).stem, '我在后台改过的题干');
 
   await close(server);
+}
+
+/* ============ 第四阶段：图片上传与 /media/ 托管 ============ */
+{
+  const PNG_1PX = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+  const GIF_1PX = 'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'cpubiomed-media-'));
+  const db = createMemoryDb();
+  const media = createMediaStore(dir);
+  const { server, anon, call } = await start(db, { ADMIN_USER: USER, ADMIN_PASSWORD: PASS }, media);
+
+  eq('png 文件头识别', detectImage(Buffer.from(PNG_1PX, 'base64')), 'png');
+  eq('gif 文件头识别', detectImage(Buffer.from(GIF_1PX, 'base64')), 'gif');
+  eq('纯文本不是图片', detectImage(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>')), null);
+
+  eq('匿名上传被拦', (await anon('POST', API + '?action=upload', { data: PNG_1PX })).status, 401);
+
+  await anon('POST', API + '?action=register', { username: 'student', password: 'study-hard-1', display_name: '同学' });
+  const plainCookie = cookieOf(await anon('POST', API + '?action=login', { username: 'student', password: 'study-hard-1' }));
+  const asPlain = (method, url, body) => anon(method, url, body, { Cookie: plainCookie });
+  const plainRes = await asPlain('POST', API + '?action=upload', { data: PNG_1PX });
+  eq('普通用户上传被拒', plainRes.status, 403);
+  eq('普通用户上传的错误码', (await plainRes.json()).error, 'not_admin');
+
+  eq('upload 只收 POST', (await call('GET', API + '?action=upload')).status, 405);
+
+  const ok = await call('POST', API + '?action=upload', { data: PNG_1PX });
+  eq('管理员上传成功', ok.status, 200);
+  const { url } = await ok.json();
+  check('返回的是 /media/ 相对路径', /^\/media\/\d{6}\/[0-9a-f]{24}\.png$/.test(url), url);
+
+  const onDisk = await readFile(path.join(dir, url.slice('/media/'.length)));
+  eq('落盘字节与原图一致', onDisk.equals(Buffer.from(PNG_1PX, 'base64')), true);
+
+  const served = await anon('GET', url);
+  eq('图片可公开读取', served.status, 200);
+  eq('图片 content-type 正确', served.headers.get('content-type'), 'image/png');
+  check('图片走长缓存', /immutable/.test(served.headers.get('cache-control') || ''), served.headers.get('cache-control'));
+
+  const dataUrl = await call('POST', API + '?action=upload', { data: 'data:image/png;base64,' + GIF_1PX });
+  const dataUrlBody = await dataUrl.json();
+  eq('接受 data URL 前缀', dataUrl.status, 200);
+  // 前缀声明的是 png，文件头是 gif：以文件头为准，否则扩展名和真实内容能被人随意对不上。
+  check('扩展名按文件头判定，不信前缀声明', /\.gif$/.test(dataUrlBody.url), dataUrlBody.url);
+
+  const svgRes = await call('POST', API + '?action=upload', {
+    data: Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>').toString('base64'),
+  });
+  eq('SVG 一律拒收', svgRes.status, 415);
+  eq('SVG 拒收的错误码', (await svgRes.json()).error, 'unsupported_image');
+
+  const tooBig = Buffer.concat([Buffer.from(PNG_1PX, 'base64'), Buffer.alloc(MAX_IMAGE_BYTES)]);
+  eq('超过 2 MB 被拒', (await call('POST', API + '?action=upload', { data: tooBig.toString('base64') })).status, 413);
+  eq('非法 base64 被拒', (await call('POST', API + '?action=upload', { data: 'not base64 !!' })).status, 400);
+  eq('缺 data 字段被拒', (await call('POST', API + '?action=upload', {})).status, 400);
+
+  eq('穿越到目录外读不到', (await anon('GET', '/media/../../etc/passwd')).status, 404);
+  eq('读不存在的图返回 404', (await anon('GET', '/media/202610/' + 'f'.repeat(24) + '.png')).status, 404);
+  eq('非图片扩展名不发', media.resolve('/nope.txt'), null);
+
+  await close(server);
+
+  // 没配 MEDIA_DIR 时上传要明说不可用，而不是把文件写进代码目录
+  const bare = await start(createMemoryDb());
+  eq('未配置存储时回 503', (await bare.call('POST', API + '?action=upload', { data: PNG_1PX })).status, 503);
+  eq('未配置存储时的错误码', (await (await bare.call('POST', API + '?action=upload', { data: PNG_1PX })).json()).error, 'upload_unavailable');
+  await close(bare.server);
+
+  await rm(dir, { recursive: true, force: true });
+}
+
+/* ============ 第五阶段：离线体检脚本与导入模板 ============ */
+{
+  const { checkBankFile } = await import('../deploy/tools/check-bank.mjs');
+
+  // 模板是给用户照抄的起点，它自己必须过校验：validate.mjs 一改，
+  // 模板没跟着改的话这里会立刻炸，而不是等用户导进去被接口拒了才发现。
+  const tpl = await checkBankFile(path.join(ROOT, 'deploy', 'tools', 'bank-template.json'));
+  eq('模板无致命错误', tpl.fatal, null);
+  eq('模板零错误', tpl.errors, []);
+  // 模板里的编号都叫 demo-*，体检脚本本来就该提醒改掉；除了这一类，别的一律不许有。
+  eq('模板只报 demo 编号提醒', tpl.warnings.filter((w) => w.group !== 'demo-id'), []);
+  check('每条示例都被提醒改编号', tpl.warnings.length === 6, tpl.warnings.length);
+  eq('模板条目数', tpl.total, 8);
+  check('模板含公式或图片示例', tpl.rowsWithMathOrImage >= 4, tpl.rowsWithMathOrImage);
+
+  const builtin = await checkBankFile(path.join(ROOT, 'deploy', 'server', 'content.json'));
+  eq('内置题库零错误', builtin.errors, []);
+  eq('内置题库条数与种子一致', builtin.total, 353 + 32 + 89);
+
+  // 体检脚本本身：坏的条目要能逐条报出编号和字段
+  const tmp = await mkdtemp(path.join(os.tmpdir(), 'cpubiomed-check-'));
+  const badFile = path.join(tmp, 'bad.json');
+  await writeFile(badFile, JSON.stringify({
+    questions: [
+      { id: 'Demo-Upper', subject: 'xxx', qtype: 'single', level: 9, stem: '', opts: ['甲'], answer: 3, explain: '写错字段名' },
+      { id: 'ok-1', subject: 'bio', chapter: '第一章', qtype: 'multi', level: 2, stem: '$E=mc^2$ 和 ![图](/media/x.png)',
+        opts: ['甲', '乙', '丙'], answer: [0, 0], explain_text: '单选下标' },
+      { id: 'ok-1', subject: 'bio', chapter: '第一章', qtype: 'judge', level: 1, stem: '重复编号',
+        opts: ['正确', '错误'], answer: 0 },
+    ],
+    cards: 'not-an-array',
+  }), 'utf8');
+  const bad = await checkBankFile(badFile);
+  eq('坏文件无致命错误', bad.fatal, null);
+  check('坏文件报出多处错误', bad.errors.length >= 8, bad.errors.length);
+  check('指出编号大小写非法', bad.errors.some((e) => e.field === 'id'), bad.errors);
+  check('指出科目非法', bad.errors.some((e) => e.field === 'subject'), bad.errors);
+  check('指出难度越界', bad.errors.some((e) => e.field === 'level'), bad.errors);
+  check('指出题干为空', bad.errors.some((e) => e.field === 'stem'), bad.errors);
+  check('指出答案与选项不匹配', bad.errors.some((e) => e.field === 'answer'), bad.errors);
+  check('指出数组类型错误', bad.errors.some((e) => e.field === 'cards'), bad.errors);
+  check('重复编号被点名', bad.errors.some((e) => /重复/.test(e.text)), bad.errors);
+  check('提示 explain 应写 explain_text', bad.warnings.some((w) => /explain_text/.test(w.text)), bad.warnings);
+  check('统计到含公式或图片的条目', bad.rowsWithMathOrImage >= 1, bad.rowsWithMathOrImage);
+
+  const missing = await checkBankFile(path.join(tmp, 'nope.json'));
+  check('读不到的文件给 fatal', typeof missing.fatal === 'string' && missing.fatal.includes('读不了'), missing.fatal);
+  await writeFile(badFile, '{ "questions": [ }', 'utf8');
+  check('JSON 语法错误给 fatal', String((await checkBankFile(badFile)).fatal).includes('JSON 解析失败'));
+
+  await rm(tmp, { recursive: true, force: true });
 }
 
 console.log(`自建后端验证：通过 ${passed}，失败 ${failures.length}`);
