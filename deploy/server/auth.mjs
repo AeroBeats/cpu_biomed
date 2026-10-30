@@ -32,6 +32,30 @@ export function newUserId() {
   return 'u_' + randomBytes(9).toString('hex');
 }
 
+/* 邀请码用 Crockford base32（去掉 I L O U，读法歧义最少）。
+   32 个符号，一个字节正好映射 8 次不产生偏置（256 % 32 === 0），8 位即 2^40 种。 */
+const INVITE_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+
+export const INVITE_LENGTH = 8;
+
+export function newInviteCode() {
+  const bytes = randomBytes(INVITE_LENGTH);
+  let out = '';
+  for (const b of bytes) out += INVITE_ALPHABET[b % 32];
+  return out;
+}
+
+/* 用户手打的码要能容错：大小写、空格、从界面复制时带上的一对短横线，
+   还有按 Crockford 规定本来就等同的 O→0、I/L→1、U→V。
+   归一化后长度不对或出现字母表外的字符就当作没填，让调用方回一个明确的错误。 */
+export function normalizeInviteCode(value) {
+  if (typeof value !== 'string' || value.indexOf('\u0000') !== -1) return null;
+  const squeezed = value.toUpperCase().replace(/[\s_-]/g, '').replace(/O/g, '0').replace(/[IL]/g, '1').replace(/U/g, 'V');
+  if (squeezed.length !== INVITE_LENGTH) return null;
+  for (const ch of squeezed) if (INVITE_ALPHABET.indexOf(ch) === -1) return null;
+  return squeezed;
+}
+
 export function hashPassword(password) {
   return new Promise((resolve, reject) => {
     const salt = randomBytes(16);

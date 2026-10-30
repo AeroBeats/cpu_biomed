@@ -3,19 +3,23 @@
    与冻结的 functions/handler.mjs 相比，这里是自建部署的唯一实现，差异有三处：
    1. 身份来自会话 Cookie（或 curl 用的 HTTP Basic），不是网关注入的用户上下文；
    2. 权限看 app_users.role，不再是 site_settings 里的单一所有者；
-   3. 多了 login / logout / register / session / progress / upload 六个动作。 */
+   3. 多了 login / logout / register / session / progress / upload 六个动作；
+   4. 注册要凭管理员发的一次性邀请码（invite_codes），并带来源 IP 的失败限流。 */
 
 import {
   AppError, idOf, parseBody, questionRow, chapterRow, cardRow,
-  usernameOf, passwordOf, displayNameOf, progressData,
+  usernameOf, passwordOf, displayNameOf, progressData, inviteNoteOf,
 } from './validate.mjs';
 import { MAX_READ_ROWS } from './db.mjs';
-import { hashPassword, verifyPassword, newUserId } from './auth.mjs';
+import {
+  hashPassword, verifyPassword, newUserId, newInviteCode, normalizeInviteCode,
+} from './auth.mjs';
 
 const MAX_SYNC_RECORDS = 2000;
 const CHUNK = 200;
 // 后台新增且未显式给排序值时，排在内置内容之后。
 const NEW_SORT_ORDER = 9000;
+const MAX_INVITES = 500;
 
 const METHODS = {
   bank: 'GET',
@@ -28,6 +32,7 @@ const METHODS = {
   'upsert-chapter': 'POST', 'delete-chapter': 'POST',
   'upsert-card': 'POST', 'delete-card': 'POST',
   'sync-builtin': 'POST',
+  'list-invites': 'GET', 'create-invite': 'POST', 'delete-invite': 'POST',
   upload: 'POST',
 };
 
@@ -76,6 +81,35 @@ async function rejectWithoutUser(password) {
   if (dummyHash === null) dummyHash = await hashPassword(newUserId());
   await verifyPassword(password, dummyHash);
   return false;
+}
+
+/* 注册按来源 IP 记失败次数。只记失败，成功一次就清零：
+   一个宿舍/一间机房共用出口 NAT 时，老老实实拿码注册的人不该互相拖累，
+   而猜码的人只会留下失败。进程内计数、重启清零，够用——
+   它的目的只是让「猜码」在经济上不划算，不是挡分布式攻击。 */
+const REGISTER_WINDOW_MS = 60 * 60 * 1000;
+const REGISTER_MAX_FAILS = 20;
+const registerFails = new Map();      // ip -> { n, resetAt }
+
+function noteRegisterFail(ip) {
+  if (!ip) return false;             // 拿不到来源就放行，别把整站锁死
+  const now = Date.now();
+  if (registerFails.size > 5000) {
+    registerFails.forEach((v, k) => { if (v.resetAt <= now) registerFails.delete(k); });
+  }
+  const cur = registerFails.get(ip);
+  if (!cur || cur.resetAt <= now) {
+    registerFails.set(ip, { n: 1, resetAt: now + REGISTER_WINDOW_MS });
+    return false;
+  }
+  cur.n += 1;
+  return cur.n > REGISTER_MAX_FAILS;
+}
+
+function registerLimited(ip) {
+  if (!ip) return false;
+  const cur = registerFails.get(ip);
+  return !!cur && cur.n > REGISTER_MAX_FAILS;
 }
 
 // 只插不改：重新灌入内置内容时不能覆盖后台后来做过的编辑。
@@ -160,12 +194,24 @@ async function handleLogin(ctx, db, auth) {
 }
 
 async function handleRegister(ctx, db, auth) {
+  if (registerLimited(ctx.ip)) throw new AppError('too_many_trials', 429);
   const body = parseBody(ctx.bodyText);
   const username = usernameOf(body.username);
   const password = passwordOf(body.password);
   const displayName = displayNameOf(body.display_name);
+
+  // 注册不再是开放的：必须带一个管理员发出去、还没被用过的码。
+  const code = normalizeInviteCode(body.invite);
+  if (!code) { noteRegisterFail(ctx.ip); return json({ error: 'invite_needed', field: 'invite' }, 400); }
+
   // 管理员用户名是 .env 指定的，不能被注册抢走，否则真正的管理员再也登不进来。
   if (auth.isReserved(username)) return json({ error: 'username_taken', field: 'username' }, 409);
+  // 先查一次占用，否则用户名撞车会把一个好码白白烧掉（claim 是不可逆的）。
+  if (await db.findUserByUsername(username)) return json({ error: 'username_taken', field: 'username' }, 409);
+
+  const invite = await db.findInvite(code);
+  if (!invite) { noteRegisterFail(ctx.ip); return json({ error: 'invite_invalid', field: 'invite' }, 400); }
+  if (invite.used_at) { noteRegisterFail(ctx.ip); return json({ error: 'invite_used', field: 'invite' }, 409); }
 
   const userId = newUserId();
   const now = new Date().toISOString();
@@ -179,6 +225,15 @@ async function handleRegister(ctx, db, auth) {
     updated_at: now,
   });
   if (!inserted) return json({ error: 'username_taken', field: 'username' }, 409);
+
+  // 码到现在还是活的：并发下可能被另一个请求先claim走。这时必须把刚建好的账号收回，
+  // 不然会留下一个「没有对应邀请码」的用户。
+  if (!await db.claimInvite(code, userId, now)) {
+    await db.deleteUser(userId);
+    noteRegisterFail(ctx.ip);
+    return json({ error: 'invite_used', field: 'invite' }, 409);
+  }
+  registerFails.delete(ctx.ip);
 
   const row = { user_id: userId, username, role: 'user', display_name: displayName };
   return json({ loggedIn: true, user: publicUser(row) }, 200, {
@@ -230,6 +285,42 @@ export async function handleBank(ctx, db, auth, media = null) {
 
     // 内容写入只有管理员能做；bank 的读取是公开的，浏览不需要登录。
     requireAdmin(ctx);
+
+    if (action === 'list-invites') {
+      const rows = await db.listInvites(MAX_INVITES);
+      return json({
+        invites: rows.map((r) => ({
+          code: r.code,
+          note: r.note || '',
+          created_at: new Date(r.created_at).toISOString(),
+          used_at: r.used_at ? new Date(r.used_at).toISOString() : null,
+          // 用完之后账号又被删掉时，join 出来的用户名是空的，但 used_at 仍然说明这个码被消费过。
+          used_by: r.used_by || '',
+        })),
+        truncated: rows.length === MAX_INVITES,
+      });
+    }
+
+    if (action === 'create-invite') {
+      const note = inviteNoteOf(parseBody(ctx.bodyText).note);
+      // 2^40 的空间里撞键基本不可能，但它是主键，撞了不能让请求变成 500，重取一次即可。
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const code = newInviteCode();
+        if (await db.insertInvite({ code, note, created_by: ctx.user.user_id, created_at: now })) {
+          return json({ code, note });
+        }
+      }
+      throw new AppError('invite_generate_failed', 503);
+    }
+
+    if (action === 'delete-invite') {
+      // 作废就是删行：未用过的码消失，已用过的码也只是一条记录被清掉，
+      // 不会反过来把那个已注册的账号删了（账号删除走 app_users 那边）。
+      const code = normalizeInviteCode(parseBody(ctx.bodyText).code);
+      if (!code) throw new AppError('invalid_field', 400, 'code');
+      if (!await db.deleteInvite(code)) return json({ error: 'not_found' }, 404);
+      return json({ code, revoked: true });
+    }
 
     if (action === 'upload') {
       // MEDIA_DIR 没配就是没打算存图，明确说清是不可用而不是静默失败。

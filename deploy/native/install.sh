@@ -320,8 +320,10 @@ cat <<DONE
   重启        systemctl restart $SERVICE_NAME
 
 下一步（在你自己电脑的浏览器里做）：
-  1. 打开站点，右下角「登录 / 注册」里用上面的管理员账号登录，
+  1. 打开站点，左下角「登录 / 注册」里用上面的管理员账号登录，
      登录后导航里会自动出现「内容管理」
-  2. 迁移学习进度：见 deploy/README.md 第 7a 节
-  3. 配 HTTPS：见 deploy/README.md 第 8 节
+  2. 要让别人注册：内容管理 →「注册邀请码」→ 生成一个发给对方（一次性），
+     流程见 deploy/README.md 第 5b 节
+  3. 迁移学习进度：见 deploy/README.md 第 7a 节
+  4. 配 HTTPS：见 deploy/README.md 第 8 节
 DONE

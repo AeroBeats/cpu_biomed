@@ -55,7 +55,8 @@
     // Qoder 站点：mode 'gateway'，身份由平台网关给，只有「站点所有者」这一个概念。
     owner: { status: 'loading' },          // loading | anon | unclaimed | owner | other | error
     admin: { tab: 'questions', subject: 'bio', q: '', editing: null, busy: false, msg: null,
-             preview: false, imgBusy: false, importErrors: null },
+             preview: false, imgBusy: false, importErrors: null,
+             invites: null, invitesBusy: false, inviteNote: '', invitesTruncated: false },
     route: 'dashboard'
   };
 
@@ -1602,7 +1603,8 @@
   var ADM_TABS = [
     { id: 'questions', name: '题目' },
     { id: 'chapters', name: '考纲章节' },
-    { id: 'cards', name: '背诵卡' }
+    { id: 'cards', name: '背诵卡' },
+    { id: 'invites', name: '注册邀请码' }
   ];
   var ADM_LEVEL = { 1: '基础', 2: '常考', 3: '高频重点' };
   var ADM_LIST_CAP = 200;
@@ -2050,10 +2052,13 @@
         '云端一旦有了题目就会成为唯一数据源，空云端里只加几条，会让随站点打包的内置题目在界面上全部消失。</div>' + msg;
     }
 
-    var tabs = '<div class="chip-row" style="margin-bottom:12px">' + ADM_TABS.map(function (t) {
-      return '<button class="chip" data-act="adm-tab" data-v="' + t.id + '" aria-pressed="' + (a.tab === t.id) + '">' +
-        t.name + '</button>';
-    }).join('') + '</div>';
+    // 邀请码只在自建部署的账号体系里存在；Qoder 那侧由平台管身份，没有这个标签页。
+    var tabs = '<div class="chip-row" style="margin-bottom:12px">' +
+      ADM_TABS.filter(function (t) { return t.id !== 'invites' || state.account.mode === 'accounts'; })
+        .map(function (t) {
+          return '<button class="chip" data-act="adm-tab" data-v="' + t.id + '" aria-pressed="' + (a.tab === t.id) + '">' +
+            t.name + '</button>';
+        }).join('') + '</div>';
 
     var subjChips = [{ id: 'all', name: '全部' }].concat(SUBJ_ORDER.map(function (s) {
       return { id: s, name: SUBJ[s].code + ' ' + SUBJ[s].name };
@@ -2073,6 +2078,8 @@
       '</div>' +
       '<div class="chip-row" style="margin-bottom:12px">' + subjChips + '</div>';
 
+    var isInvites = a.tab === 'invites';
+
     return head +
       '<div class="card" style="margin-bottom:16px">' +
       '<div class="adm-src">' + sourceLine + '</div>' +
@@ -2085,12 +2092,119 @@
       manageCard + '</div>' +
       msg +
       importErrorsCard() +
-      (canWrite ? admEditor() : '') +
-      '<div class="card">' + tabs + toolbar +
-      (canWrite ? '' : '<p class="fey-note" style="margin-bottom:12px">' +
-        (state.owner.status === 'other' ? '当前账号只能浏览，不能修改内容。' : '启用后台管理后可以新建、编辑和删除内容。') + '</p>') +
-      '<div class="adm-list" id="adminList"></div>' +
+      (canWrite && !isInvites ? admEditor() : '') +
+      '<div class="card">' + tabs +
+      (isInvites ? invitePanel() : toolbar +
+        (canWrite ? '' : '<p class="fey-note" style="margin-bottom:12px">' +
+          (state.owner.status === 'other' ? '当前账号只能浏览，不能修改内容。' : '启用后台管理后可以新建、编辑和删除内容。') + '</p>') +
+        '<div class="adm-list" id="adminList"></div>') +
       '</div>';
+  }
+
+  /* ---------------- 注册邀请码（只有自建部署的账号体系有） ---------------- */
+
+  function inviteDay(iso) {
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return '';
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+  }
+
+  // 每 4 位加一个短横线，方便照着念、照着抄；后端归一化时会把横线吃掉。
+  function invitePretty(code) {
+    return String(code).replace(/(.{4})(?=.)/g, '$1-');
+  }
+
+  function loadInvites() {
+    var a = state.admin;
+    if (a.invitesBusy) return;
+    a.invitesBusy = true;
+    window.Cloud.listInvites().then(function (res) {
+      a.invites = (res && res.invites) || [];
+      a.invitesTruncated = !!(res && res.truncated);
+      a.invitesBusy = false;
+      render();
+    }, function (e) {
+      a.invites = [];
+      a.invitesBusy = false;
+      admMsg('err', (e && e.message) || '邀请码列表读取失败。');
+      render();
+    });
+  }
+
+  function inviteCreate() {
+    var a = state.admin;
+    if (a.invitesBusy) return;
+    a.invitesBusy = true;
+    var note = String(a.inviteNote || '').trim();
+    admMsg('info', '正在生成…');
+    render();
+    window.Cloud.createInvite(note).then(function (res) {
+      a.invitesBusy = false;
+      a.inviteNote = '';
+      admMsg('ok', '新邀请码：' + ((res && res.code) || '') + '　发给对方就能注册，一个码只能用一次。');
+      loadInvites();
+    }, function (e) {
+      a.invitesBusy = false;
+      admMsg('err', (e && e.message) || '生成失败。');
+      render();
+    });
+  }
+
+  function inviteRevoke(code, used) {
+    var a = state.admin;
+    if (a.invitesBusy) return;
+    if (!window.confirm(used
+      ? '删除这条已使用的邀请码记录？只删记录，不会动那个账号。'
+      : '作废这个邀请码？作废之后这个码就没人能用了。')) return;
+    a.invitesBusy = true;
+    window.Cloud.revokeInvite(code).then(function () {
+      a.invitesBusy = false;
+      admMsg('ok', used ? '记录已删除。' : '邀请码已作废。');
+      loadInvites();
+    }, function (e) {
+      a.invitesBusy = false;
+      admMsg('err', (e && e.message) || '操作失败。');
+      render();
+    });
+  }
+
+  function invitePanel() {
+    var a = state.admin;
+    var head = '<div class="card-head"><h2>注册邀请码</h2>' +
+      '<span class="hint">一次性的，用过就作废</span></div>' +
+      '<div class="row wrap" style="gap:8px;margin-bottom:10px">' +
+      '<input class="adm-search" type="text" data-bind="invite-note" maxlength="60" value="' + esc(a.inviteNote) +
+      '" placeholder="备注，例如「发给张三 · 药学一班」" aria-label="邀请码备注">' +
+      '<button class="btn btn-sm btn-primary" data-act="invite-new"' + (a.invitesBusy ? ' disabled' : '') + '>' +
+      (a.invitesBusy ? '处理中…' : '生成一个') + '</button>' +
+      '<button class="btn btn-sm btn-ghost" data-act="invite-refresh"' + (a.invitesBusy ? ' disabled' : '') +
+      '>重新读取</button></div>' +
+      '<p class="fey-note" style="margin-bottom:12px">把码发给同学，对方在「账号 → 注册新账号」里填进去就能建号。' +
+      '一个码只能用一次；没发出去的码可以随时作废。字母表里不含 I、L、O、U，' +
+      '所以手抄时 0 和 O、1 和 I 看成哪个都认得。</p>';
+    if (!a.invites) return head + '<p class="adm-state">正在读取邀请码…</p>';
+    if (!a.invites.length) {
+      return head + '<div class="empty"><p class="empty-title">还没有邀请码</p>' +
+        '<p>点上面的「生成一个」，把码发给要注册的人。</p></div>';
+    }
+    var unused = a.invites.filter(function (r) { return !r.used_at; }).length;
+    return head +
+      '<p class="fey-note" style="margin-bottom:8px">共 ' + a.invites.length + ' 条，其中 ' + unused + ' 个还没用。</p>' +
+      '<ul class="inv-list">' + a.invites.map(function (r) {
+        return '<li class="inv-row">' +
+          '<code class="inv-code">' + esc(invitePretty(r.code)) + '</code>' +
+          '<span class="inv-note">' + (r.note ? esc(r.note) : '<i class="inv-none">无备注</i>') + '</span>' +
+          (r.used_at
+            ? '<span class="tag tag-mute">已用 · ' + esc(inviteDay(r.used_at)) +
+              (r.used_by ? ' · ' + esc(r.used_by) : ' · 账号已删') + '</span>' +
+              '<button class="btn btn-sm btn-ghost btn-danger" data-act="invite-revoke" data-v="' +
+              esc(r.code) + '" data-v2="used">删记录</button>'
+            : '<span class="tag tag-own">未使用</span>' +
+              '<button class="btn btn-sm btn-ghost btn-danger" data-act="invite-revoke" data-v="' +
+              esc(r.code) + '">作废</button>') +
+          '</li>';
+      }).join('') + '</ul>' +
+      (a.invitesTruncated ? '<p class="fey-note" style="margin-top:8px">只列出最近 500 条。</p>' : '');
   }
 
   function admMsg(kind, text) {
@@ -2552,6 +2666,10 @@
       'pattern="[A-Za-z0-9_.\\-]{3,32}" placeholder="3–32 位字母、数字或 . _ -" ' +
       'title="3–32 位字母、数字、点、下划线或短横线">' +
       '<small>不区分大小写，存进数据库时会统一转成小写。</small></label>' +
+      (reg ? '<label class="acc-field"><span>邀请码</span>' +
+        '<input type="text" name="invite" required maxlength="24" autocomplete="one-time-code" spellcheck="false" ' +
+        'placeholder="管理员发的一次性码，例如 4T9K-M2XH">' +
+        '<small>注册需要邀请码（一次性的）。没有的话找管理员要一个。</small></label>' : '') +
       (reg ? '<label class="acc-field"><span>昵称（可选）</span>' +
         '<input type="text" name="displayName" maxlength="40" autocomplete="nickname" placeholder="留空就用用户名"></label>' : '') +
       '<label class="acc-field"><span>口令</span>' +
@@ -2564,8 +2682,8 @@
       (a.busy ? ' disabled' : '') + '>' + (a.busy ? '处理中…' : label) + '</button>' +
       '</form>' +
       '<p class="fey-note" style="margin-top:12px">' +
-      (reg ? '注册是开放的，任何人都能建账号；只有管理员账号能看到「内容管理」并修改题库。'
-        : '还没有账号就切到「注册新账号」，注册完直接就是登录状态。') + '</p>' +
+      (reg ? '注册要填管理员发的邀请码，一个码只能用一次；注册进来是「学习者」，看不到也改不了题库内容。'
+        : '没有账号的话切到「注册新账号」，找管理员要一个一次性邀请码，注册完直接就是登录状态。') + '</p>' +
       '</div>';
   }
 
@@ -2625,7 +2743,8 @@
     accSetMsg(null);
     accBusy(true);
     var req = reg
-      ? window.Cloud.register(username, password, String(f.displayName.value || '').trim())
+      ? window.Cloud.register(username, password, String(f.displayName.value || '').trim(),
+          String(f.invite.value || '').trim())
       : window.Cloud.login(username, password);
     req.then(function (res) {
       state.account.user = (res && res.user) || null;
@@ -3095,8 +3214,12 @@
         state.admin.tab = el.getAttribute('data-v');
         state.admin.editing = null;
         render();
+        if (state.admin.tab === 'invites' && !state.admin.invites) loadInvites();
         break;
       }
+      case 'invite-new': inviteCreate(); break;
+      case 'invite-refresh': loadInvites(); break;
+      case 'invite-revoke': inviteRevoke(el.getAttribute('data-v'), el.getAttribute('data-v2') === 'used'); break;
       case 'adm-subject': {
         state.admin.subject = el.getAttribute('data-v');
         renderAdminList();
@@ -3235,6 +3358,11 @@
       // 只重绘列表，避免整页重渲染打断输入焦点。
       state.admin.q = el.value;
       renderAdminList();
+      return;
+    }
+    if (b === 'invite-note') {
+      // 备注只存进 state，不重渲染——否则一边打字一边被重建，光标会跳回开头。
+      state.admin.inviteNote = el.value;
       return;
     }
     // 编辑器的字段改动只刷新预览，state 里的草稿仍是旧的（保存时统一读取）。

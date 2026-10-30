@@ -17,6 +17,7 @@ export function createMemoryDb() {
   const users = new Map();      // user_id -> row
   const byName = new Map();     // username -> user_id
   const progress = new Map();   // user_id -> { data, updated_at }
+  const invites = new Map();    // code -> { code, note, created_by, created_at, used_by, used_at }
 
   const need = (table) => {
     const found = tables[table];
@@ -28,6 +29,7 @@ export function createMemoryDb() {
     _tables: tables,
     _users: users,
     _progress: progress,
+    _invites: invites,
 
     async ping() {},
     async close() {},
@@ -107,6 +109,59 @@ export function createMemoryDb() {
       row.pass_hash = passHash;
       row.updated_at = now;
       return true;
+    },
+
+    // 照搬外键行为：进度级联删，邀请码只把 used_by 置空（码保持已用）。
+    async deleteUser(userId) {
+      const row = users.get(userId);
+      if (!row) return false;
+      users.delete(userId);
+      byName.delete(row.username);
+      progress.delete(userId);
+      invites.forEach((inv) => { if (inv.used_by === userId) { inv.used_by = null; } });
+      return true;
+    },
+
+    async findInvite(code) {
+      const row = invites.get(code);
+      // 真库只 SELECT code 和 used_at，替身也照样裁剪。
+      return row ? { code: row.code, used_at: row.used_at } : null;
+    },
+
+    async claimInvite(code, userId, now) {
+      const row = invites.get(code);
+      // 与真库同一条 WHERE：看 used_at，删账号留下的空 used_by 不能让码复活。
+      if (!row || row.used_at) return false;
+      row.used_by = userId;
+      row.used_at = now;
+      return true;
+    },
+
+    async insertInvite(row) {
+      if (invites.has(row.code)) return false;
+      invites.set(row.code, {
+        code: row.code, note: row.note, created_by: row.created_by,
+        created_at: row.created_at, used_by: null, used_at: null,
+      });
+      return true;
+    },
+
+    async listInvites(limit) {
+      const rows = [...invites.values()]
+        .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)) || b.code.localeCompare(a.code))
+        .slice(0, limit)
+        .map((row) => {
+          const user = row.used_by ? users.get(row.used_by) : null;
+          return {
+            code: row.code, note: row.note, created_at: row.created_at,
+            used_at: row.used_at, used_by: user ? user.username : null,
+          };
+        });
+      return rows;
+    },
+
+    async deleteInvite(code) {
+      return invites.delete(code);
     },
 
     async getProgress(userId) {

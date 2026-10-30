@@ -147,6 +147,14 @@ export function displayNameOf(value) {
   return name.trim();
 }
 
+// 邀请码的备注只是给管理员自己看的（「发给张三 3班」），可留空。
+export function inviteNoteOf(value) {
+  const note = str(value, 0, 60, 'note', true);
+  if (note === null) return '';
+  if (CONTROL_RE.test(note)) bad('note');
+  return note.trim();
+}
+
 export function progressData(body) {
   const data = body.data;
   if (!data || typeof data !== 'object' || Array.isArray(data)) bad('data');

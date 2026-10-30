@@ -37,6 +37,11 @@ window.Cloud = (function () {
     login_required: '这个操作需要先登录。',
     bad_credentials: '用户名或口令不对，请重试。',
     username_taken: '这个用户名已经被占用，换一个吧。',
+    invite_needed: '注册要填邀请码：找管理员要一个，一次性的。',
+    invite_invalid: '邀请码不对。请照管理员发来的原样输入（0 和 O、1 和 I 在这套码里是同一个字符）。',
+    invite_used: '这个邀请码已经被用过了，一次性的，再要一个新的吧。',
+    invite_generate_failed: '邀请码生成失败，请重试。',
+    too_many_trials: '注册失败次数太多，请一小时后再试。',
     not_admin: '当前账号没有管理权限，只能浏览内容和同步自己的进度。',
     progress_too_large: '进度数据太大，无法同步到服务器。',
     image_too_large: '图片超过 2 MB，请先压一压再上传。',
@@ -228,8 +233,8 @@ window.Cloud = (function () {
     login: function (username, password) {
       return post('login', { username: username, password: password });
     },
-    register: function (username, password, displayName) {
-      var body = { username: username, password: password };
+    register: function (username, password, displayName, invite) {
+      var body = { username: username, password: password, invite: invite };
       if (displayName) body.display_name = displayName;
       return post('register', body);
     },
@@ -279,6 +284,11 @@ window.Cloud = (function () {
     upsertChapter: function (row) { return post('upsert-chapter', row); },
     deleteChapter: function (id) { return post('delete-chapter', { id: id }); },
     upsertCard: function (row) { return post('upsert-card', row); },
-    deleteCard: function (id) { return post('delete-card', { id: id }); }
+    deleteCard: function (id) { return post('delete-card', { id: id }); },
+    /* 一次性邀请码 · 只有自建部署的账号体系有这套动作，Qoder 那侧（gateway 模式）没有。
+       界面上只在 accounts 模式且是管理员时才调用，所以这里不做额外分支。 */
+    listInvites: function () { return get('list-invites'); },
+    createInvite: function (note) { return post('create-invite', { note: note || '' }); },
+    revokeInvite: function (code) { return post('delete-invite', { code: code }); }
   };
 })();

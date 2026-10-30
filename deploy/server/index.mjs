@@ -146,6 +146,20 @@ function isSecure(req) {
   return typeof first === 'string' && first.split(',')[0].trim().toLowerCase() === 'https';
 }
 
+/* 注册限流按来源 IP 记，所以这里要分清「谁在跟我说话」。
+   x-forwarded-for 是客户端可以随意伪造的头，只有当连接确实来自我们自己那层
+   （回环或内网/容器网段的 nginx）时才认它；否则只信 socket，宁可比真实来源粗一点。 */
+const INTERNAL_NET = /^(::1|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/;
+const debase = (ip) => String(ip).replace(/^::ffff:/i, '');
+
+function clientIp(req) {
+  const peer = debase(req.socket && req.socket.remoteAddress ? req.socket.remoteAddress : '');
+  if (!INTERNAL_NET.test(peer)) return peer;
+  const xff = req.headers['x-forwarded-for'];
+  const first = debase((Array.isArray(xff) ? xff[0] : xff || '').split(',')[0]).trim();
+  return first || peer;
+}
+
 /** 会话 Cookie 优先，其次 HTTP Basic（留给 curl 与安装脚本自检）。
     角色每次都回库读，所以撤权立即生效。查不到就当匿名，绝不抛错挡住静态页面。 */
 async function resolveUser(req, db, auth) {
@@ -190,7 +204,8 @@ export function createServer({ db, auth, media = null }) {
         let bodyText = '';
         if (req.method === 'POST') bodyText = await readBody(req);
         const result = await handleBank(
-          { method: req.method, url: req.url, user, bodyText, secure: isSecure(req) }, db, auth, media);
+          { method: req.method, url: req.url, user, bodyText, secure: isSecure(req), ip: clientIp(req) },
+          db, auth, media);
         return sendJson(res, result.status, result.body, result.headers);
       }
       return await serveStatic(req, res, url.pathname);

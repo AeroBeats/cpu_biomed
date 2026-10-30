@@ -72,3 +72,17 @@ CREATE TABLE IF NOT EXISTS user_progress (
   data       jsonb       NOT NULL DEFAULT '{}'::jsonb,
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+
+/* 注册邀请码 · 一次性
+   used_by 为空 = 还没用过。删账号时把它置 NULL 而不是级联删除：
+   README 里「删掉账号让人重新注册」是常规操作，外键如果 RESTRICT 会让那条 DELETE 直接失败；
+   留着 used_at 才能证明这个码确实被消费过，只是使用者已经不在了。 */
+CREATE TABLE IF NOT EXISTS invite_codes (
+  code       text        NOT NULL,
+  note       text        NOT NULL DEFAULT '',
+  created_by text        NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  used_by    text        REFERENCES app_users (user_id) ON DELETE SET NULL,
+  used_at    timestamptz,
+  PRIMARY KEY (code)
+);

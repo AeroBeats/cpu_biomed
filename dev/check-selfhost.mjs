@@ -1,7 +1,7 @@
 /* 自建后端本地验证：node dev/check-selfhost.mjs
-   用内存数据库替身跑通账号会话、静态托管、全部 action 与校验规则，
+   用内存数据库替身跑通账号会话、邀请码注册、静态托管、全部 action 与校验规则，
    并把 deploy/server/content.json 整份灌一遍，确认 353 条种子数据都能通过校验。
-   最后一阶段用同一份规则反过来体检导入模板和离线脚本本身。
+   再用同一份规则反过来体检导入模板和离线脚本本身。
    不需要 Docker、不需要 pg、不需要联网。 */
 
 import path from 'node:path';
@@ -51,18 +51,24 @@ function request(base, method, url, body, headers) {
   });
 }
 
+// 注册失败按来源 IP 计数，而那份计数是模块级的、跨服务实例共用。
+// 所以每个阶段用不同的转发地址，免得上一阶段攒下的失败把这一阶段的桶点满。
+let stageSeq = 0;
+
 async function start(db, env = { ADMIN_USER: USER, ADMIN_PASSWORD: PASS }, media = null) {
   const auth = createAuth(env);
   const boot = await auth.ensureAdmin(db);
   const server = createServer({ db, auth, media });
   const port = await listen(server);
   const base = 'http://127.0.0.1:' + port;
+  const ip = '203.0.113.' + (++stageSeq);
+  const withIp = (extra) => ({ 'X-Forwarded-For': ip, ...extra });
   return {
-    server, base, auth, boot,
+    server, base, auth, boot, ip,
     // 匿名请求：不带任何凭据。
-    anon: (method, url, body, headers) => request(base, method, url, body, headers),
+    anon: (method, url, body, headers) => request(base, method, url, body, withIp(headers)),
     // 管理员请求：默认走 Basic，模拟 curl -u 的自检路径；传 Cookie 可覆盖。
-    call: (method, url, body, headers) => request(base, method, url, body, { Authorization: GOOD, ...headers }),
+    call: (method, url, body, headers) => request(base, method, url, body, withIp({ Authorization: GOOD, ...headers })),
   };
 }
 
@@ -210,30 +216,28 @@ const sampleQuestion = (id, over = {}) => ({
     { loggedIn: false, user: null });
 
   // ---------- 注册与普通用户权限 ----------
-  const reg = await anon('POST', API + '?action=register',
-    { username: 'YanYou', password: 'study-hard-2027', display_name: '研友' });
-  eq('注册成功并自动登录', reg.status, 200);
-  const regBody = await reg.json();
-  eq('用户名统一转小写', regBody.user.username, 'yanyou');
-  eq('新账号是普通用户', regBody.user.role, 'user');
-  eq('显示名保留原样', regBody.user.name, '研友');
-  const userCookie = cookieOf(reg);
-  check('注册也下发会话 Cookie', userCookie.startsWith(SESSION_COOKIE + '='), userCookie);
-  const asUser = { Cookie: userCookie };
+  // 注册是邀请制的：管理员先发稿，对方拿码注册。create-invite 只有管理员能用。
+  eq('匿名不能生成邀请码', (await anon('POST', API + '?action=create-invite', {})).status, 401);
+  eq('匿名不能读邀请码列表', (await anon('GET', API + '?action=list-invites')).status, 401);
+  const newInvite = async (note) =>
+    (await (await call('POST', API + '?action=create-invite', { note: note || '' })).json()).code;
 
-  const userWrite = await anon('POST', API + '?action=upsert-question', sampleQuestion('q-nope'), asUser);
-  eq('普通用户写内容 → 403', userWrite.status, 403);
-  eq('403 错误码', (await userWrite.json()).error, 'not_admin');
-  eq('普通用户同步内置 → 403', (await anon('POST', API + '?action=sync-builtin', { questions: [] }, asUser)).status, 403);
-  eq('普通用户删题 → 403', (await anon('POST', API + '?action=delete-question', { id: 'q-one' }, asUser)).status, 403);
-  eq('普通用户可读题库', (await anon('GET', API + '?action=bank', undefined, asUser)).status, 200);
-
-  eq('抢注管理员用户名 → 409',
-    (await anon('POST', API + '?action=register', { username: USER.toUpperCase(), password: 'another-pass-1' })).status, 409);
-  eq('重复注册 → 409',
-    (await anon('POST', API + '?action=register', { username: 'yanyou', password: 'another-pass-1' })).status, 409);
-  eq('409 错误码', (await (await anon('POST', API + '?action=register',
-    { username: 'yanyou', password: 'another-pass-1' })).json()).error, 'username_taken');
+  const badInvite = async (body) =>
+    (await (await anon('POST', API + '?action=register', body)).json()).error;
+  eq('不带邀请码 → invite_needed',
+    await badInvite({ username: 'noinv', password: 'study-hard-2027' }), 'invite_needed');
+  eq('邀请码长度不对 → invite_needed',
+    await badInvite({ username: 'shorti', password: 'study-hard-2027', invite: 'ABC' }), 'invite_needed');
+  eq('字母表外的字符 → invite_needed',
+    await badInvite({ username: 'badchar', password: 'study-hard-2027', invite: 'ABCD&FGH' }), 'invite_needed');
+  eq('9 位超长 → invite_needed',
+    await badInvite({ username: 'toolong', password: 'study-hard-2027', invite: 'ABCDEFGHJ' }), 'invite_needed');
+  // I L O U 不是「非法字符」：按 Crockford 它们本来就是 1 1 0 0 的别名，形状合法、只是库里没这条。
+  eq('易混字符归一后按查不到处理',
+    await badInvite({ username: 'cfuse', password: 'study-hard-2027', invite: 'ILOUILOU' }), 'invite_invalid');
+  eq('码形如真但库里没有 → invite_invalid',
+    await badInvite({ username: 'ghost1', password: 'study-hard-2027', invite: 'ZZZZZZZZ' }), 'invite_invalid');
+  // 字段校验在邀请码之前：口令太短这类问题不该因为没带码而被掩盖。
   eq('注册口令太短 → 400',
     (await anon('POST', API + '?action=register', { username: 'abcd', password: '1234567' })).status, 400);
   eq('用户名含空格 → 400',
@@ -242,9 +246,106 @@ const sampleQuestion = (id, over = {}) => ({
     (await anon('POST', API + '?action=register', { username: 'ab', password: 'study-hard-2027' })).status, 400);
   eq('口令含控制字符 → 400',
     (await anon('POST', API + '?action=register', { username: 'abcd', password: 'study\nhard2027' })).status, 400);
+
+  const invite1 = await newInvite('发给研友');
+  check('生成的码是 8 位且不含 I L O U', /^[0-9A-Z]{8}$/.test(invite1) && !/[ILUO]/.test(invite1), invite1);
+  const reg = await anon('POST', API + '?action=register',
+    { username: 'YanYou', password: 'study-hard-2027', display_name: '研友', invite: invite1 });
+  eq('注册成功并自动登录', reg.status, 200);
+  const regBody = await reg.json();
+  eq('用户名统一转小写', regBody.user.username, 'yanyou');
+  eq('新账号是普通用户', regBody.user.role, 'user');
+  eq('显示名保留原样', regBody.user.name, '研友');
+  const userCookie = cookieOf(reg);
+  check('注册也下发会话 Cookie', userCookie.startsWith(SESSION_COOKIE + '='), userCookie);
+  const asUser = { Cookie: userCookie };
+  const userWrite = await anon('POST', API + '?action=upsert-question', sampleQuestion('q-nope'), asUser);
+
+  eq('普通用户不能生成邀请码',
+    (await anon('POST', API + '?action=create-invite', {}, asUser)).status, 403);
+  eq('普通用户不能读邀请码列表', (await anon('GET', API + '?action=list-invites', undefined, asUser)).status, 403);
+  eq('普通用户写内容 → 403', userWrite.status, 403);
+  eq('403 错误码', (await userWrite.json()).error, 'not_admin');
+  eq('普通用户同步内置 → 403', (await anon('POST', API + '?action=sync-builtin', { questions: [] }, asUser)).status, 403);
+  eq('普通用户删题 → 403', (await anon('POST', API + '?action=delete-question', { id: 'q-one' }, asUser)).status, 403);
+  eq('普通用户可读题库', (await anon('GET', API + '?action=bank', undefined, asUser)).status, 200);
+
+  // 一个码只用一次
+  eq('同一个码第二次注册 → invite_used',
+    await badInvite({ username: 'second1', password: 'study-hard-2027', invite: invite1 }), 'invite_used');
+  const afterUse = await (await call('GET', API + '?action=list-invites')).json();
+  const listed = afterUse.invites.find((r) => r.code === invite1);
+  eq('列表里备注带回来了', listed.note, '发给研友');
+  check('列表里的码标成已用', !!listed.used_at, listed);
+  eq('列表里能看到被谁用了', listed.used_by, 'yanyou');
+
+  // 手抄容错：小写、加横线、把 0 看成 O、把 1 看成 I 都该认
+  const invite2 = await newInvite();
+  const mangled = invite2.replace(/0/g, 'O').replace(/1/g, 'I').toLowerCase().replace(/(.{4})(?=.)/g, '$1-');
+  const reg2 = await anon('POST', API + '?action=register',
+    { username: 'mangle', password: 'study-hard-2027', invite: mangled });
+  eq('大小写/横线/O-I 混淆照样能用', reg2.status, 200);
+  await reg2.json();
+
+  eq('抢注管理员用户名 → 409',
+    (await anon('POST', API + '?action=register',
+      { username: USER.toUpperCase(), password: 'another-pass-1', invite: await newInvite() })).status, 409);
+  eq('重复注册 → 409',
+    (await anon('POST', API + '?action=register',
+      { username: 'yanyou', password: 'another-pass-1', invite: await newInvite() })).status, 409);
+  eq('409 错误码', (await (await anon('POST', API + '?action=register',
+    { username: 'yanyou', password: 'another-pass-1', invite: await newInvite() })).json()).error, 'username_taken');
   eq('不传显示名也能注册',
-    (await (await anon('POST', API + '?action=register', { username: 'second', password: 'study-hard-2027' })).json()).user.name,
+    (await (await anon('POST', API + '?action=register',
+      { username: 'second', password: 'study-hard-2027', invite: await newInvite() })).json()).user.name,
     'second');
+
+  // ---------- 发码与作废 ----------
+  eq('备注太长 → 400', (await call('POST', API + '?action=create-invite', { note: 'x'.repeat(61) })).status, 400);
+  eq('备注不是字符串 → 400', (await call('POST', API + '?action=create-invite', { note: 42 })).status, 400);
+  eq('超长备注的错误字段',
+    (await (await call('POST', API + '?action=create-invite', { note: 'x'.repeat(61) })).json()).field, 'note');
+  const invite3 = await newInvite('   发给李四   ');
+  eq('备注两端空白去掉',
+    (await (await call('GET', API + '?action=list-invites')).json()).invites.find((r) => r.code === invite3).note,
+    '发给李四');
+
+  // 同时拿同一个码注册：只能成一个，输的那个不能留下没码的账号。
+  const raceCode = await newInvite();
+  const race = await Promise.all([
+    anon('POST', API + '?action=register', { username: 'racer1', password: 'study-hard-2027', invite: raceCode }),
+    anon('POST', API + '?action=register', { username: 'racer2', password: 'study-hard-2027', invite: raceCode }),
+  ]);
+  eq('并发抢同一个码只成一个', race.filter((r) => r.status === 200).length, 1);
+  eq('另一个拿到 invite_used', race.filter((r) => r.status === 409).length, 1);
+  const raced = [await db.findUserByUsername('racer1'), await db.findUserByUsername('racer2')].filter(Boolean);
+  eq('抢输的账号被回滚，只剩一个', raced.length, 1);
+  eq('活下来的就是拿到 200 的那个', raced[0].username, race[0].status === 200 ? 'racer1' : 'racer2');
+  eq('码记在赢的那个账号上',
+    (await (await call('GET', API + '?action=list-invites')).json()).invites
+      .find((r) => r.code === raceCode).used_by, raced[0].username);
+
+  const dead = await newInvite('发错人了');
+  eq('作废没用过的码', await (await call('POST', API + '?action=delete-invite', { code: dead })).json(),
+    { code: dead, revoked: true });
+  eq('作废之后再拿来注册 → invite_invalid',
+    await badInvite({ username: 'revoked1', password: 'study-hard-2027', invite: dead }), 'invite_invalid');
+  eq('重复作废 → 404', (await call('POST', API + '?action=delete-invite', { code: dead })).status, 404);
+  eq('不传 code → 400', (await call('POST', API + '?action=delete-invite', {})).status, 400);
+  eq('普通用户不能作废', (await anon('POST', API + '?action=delete-invite', { code: invite3 }, asUser)).status, 403);
+  // 作废只是删码，不能顺手把已经注册好的账号带走。
+  eq('作废用过的码', (await call('POST', API + '?action=delete-invite', { code: invite1 })).status, 200);
+  eq('码没了，账号还能登录',
+    (await anon('POST', API + '?action=login', { username: 'yanyou', password: 'study-hard-2027' })).status, 200);
+
+  // 删掉账号是常规操作（对方忘了口令就重建一个），但码不能因此复活。
+  await db.deleteUser((await db.findUserByUsername('mangle')).user_id);
+  const residue = (await (await call('GET', API + '?action=list-invites')).json()).invites
+    .find((r) => r.code === invite2);
+  check('账号删了，码仍标着已用', !!residue.used_at, residue);
+  eq('账号删了，used_by 变空', residue.used_by, '');
+  eq('删过账号的码不能再用',
+    await badInvite({ username: 'mangle2', password: 'study-hard-2027', invite: invite2 }), 'invite_used');
 
   // ---------- 进度同步 ----------
   const payload = { v: 1, savedAt: 1700000000000, stats: { 'q-1': { right: 2, wrong: 1 } }, days: ['2026-10-21'] };
@@ -428,7 +529,10 @@ const sampleQuestion = (id, over = {}) => ({
 
   eq('匿名上传被拦', (await anon('POST', API + '?action=upload', { data: PNG_1PX })).status, 401);
 
-  await anon('POST', API + '?action=register', { username: 'student', password: 'study-hard-1', display_name: '同学' });
+  await anon('POST', API + '?action=register', {
+    username: 'student', password: 'study-hard-1', display_name: '同学',
+    invite: (await (await call('POST', API + '?action=create-invite', { note: '给同学' })).json()).code,
+  });
   const plainCookie = cookieOf(await anon('POST', API + '?action=login', { username: 'student', password: 'study-hard-1' }));
   const asPlain = (method, url, body) => anon(method, url, body, { Cookie: plainCookie });
   const plainRes = await asPlain('POST', API + '?action=upload', { data: PNG_1PX });
@@ -533,6 +637,73 @@ const sampleQuestion = (id, over = {}) => ({
   check('JSON 语法错误给 fatal', String((await checkBankFile(badFile)).fatal).includes('JSON 解析失败'));
 
   await rm(tmp, { recursive: true, force: true });
+}
+
+/* ============ 第六阶段：注册失败按来源限流 ============ */
+{
+  const db = createMemoryDb();
+  const { server, anon, call } = await start(db);
+  const invite = async () => (await (await call('POST', API + '?action=create-invite', {})).json()).code;
+  // 猜码的人：用户名每次都新，码是形状合法但库里没有的，只留失败不留账号。
+  const guess = async (n, from) => {
+    const res = await anon('POST', API + '?action=register',
+      { username: 'guesser' + n, password: 'study-hard-2027', invite: 'ZZZZZZZZ' },
+      { 'X-Forwarded-For': from });
+    await res.json();
+    return res.status;
+  };
+
+  // 计数在阈值之上才锁，所以第 21 次失败仍然放行，第 22 次才吃 429。
+  const SPOOF = '198.51.100.20';
+  eq('前 21 次猜码都没被锁', await Promise.all([...Array(21).keys()].map((i) => guess(i, SPOOF)))
+    .then((codes) => codes.filter((s) => s === 429).length), 0);
+  eq('第 22 次猜码 → 429', await guess(900, SPOOF), 429);
+  eq('429 错误码',
+    (await (await anon('POST', API + '?action=register',
+      { username: 'guesser901', password: 'study-hard-2027', invite: 'ZZZZZZZZ' },
+      { 'X-Forwarded-For': SPOOF })).json()).error, 'too_many_trials');
+  eq('锁住之后拿好码也进不来',
+    (await anon('POST', API + '?action=register',
+      { username: 'locked1', password: 'study-hard-2027', invite: await invite() },
+      { 'X-Forwarded-For': SPOOF })).status, 429);
+
+  // 限流只认这一条来源，邻居不受牵连
+  eq('换个来源照常注册',
+    (await anon('POST', API + '?action=register',
+      { username: 'neighbor', password: 'study-hard-2027', invite: await invite() },
+      { 'X-Forwarded-For': '198.51.100.21' })).status, 200);
+  eq('多段来源只看第一段（被锁那段写在后面照样锁）', await guess(902, SPOOF + ', 203.0.113.9'), 429);
+  eq('多段来源只看第一段（没被锁那段写在前面就放行）', await guess(903, '192.0.2.77, ' + SPOOF), 400);
+
+  // 共用出口 NAT 的一整间机房：一个人猜了半天，另一个人拿码还是能注册，
+  // 而且这次成功把整桶清零，后面那位再继续错也不该立刻连累大家。
+  const NAT = '198.51.100.40';
+  await Promise.all([...Array(20).keys()].map((i) => guess(i, NAT)));
+  eq('同一出口里诚实的人还能注册',
+    (await anon('POST', API + '?action=register',
+      { username: 'classmate', password: 'study-hard-2027', invite: await invite() },
+      { 'X-Forwarded-For': NAT })).status, 200);
+  eq('注册成功把计数清零', await Promise.all([...Array(21).keys()].map((i) => guess(1000 + i, NAT)))
+    .then((codes) => codes.filter((s) => s === 429).length), 0);
+
+  // 字段填错（口令太短之类）不该算成猜码，否则新手连错几次口令就被锁在门外。
+  const fresh = '198.51.100.60';
+  const wrongField = async () => {
+    const res = await anon('POST', API + '?action=register',
+      { username: 'newbie', password: 'short', invite: 'ZZZZZZZZ' }, { 'X-Forwarded-For': fresh });
+    await res.json();
+    return res.status;
+  };
+  const wrongStatuses = await Promise.all([...Array(25).keys()].map(wrongField));
+  eq('填错字段一个都不限流', wrongStatuses.filter((s) => s === 429).length, 0);
+  check('填错字段回的是 400', wrongStatuses.every((s) => s === 400), wrongStatuses[0]);
+
+  // 限流只管 register，登录失败仍然只回 bad_credentials，不因为试错被锁
+  eq('限流不影响登录',
+    (await anon('POST', API + '?action=login', { username: 'neighbor', password: 'nope-nope-nope' },
+      { 'X-Forwarded-For': SPOOF })).status, 401);
+
+  await close(server);
 }
 
 console.log(`自建后端验证：通过 ${passed}，失败 ${failures.length}`);

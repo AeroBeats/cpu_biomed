@@ -23,7 +23,7 @@ Qoder 站点保留但不再更新，作为回退备份。
 | --- | --- | --- |
 | 前端 | 平台托管的静态文件 | nginx 反代 → Node 直接托管 `web/` |
 | 题库接口 | Deno Function，路径 `/functions/v1/app` | Node 服务，**路径和 action 名都不变**，前端不用为迁移改任何东西 |
-| 登录方式 | Qoder 账号，由平台网关判定身份 | 站内账号：`.env` 里的管理员 + 开放注册的普通用户，登录页在 `#/account` |
+| 登录方式 | Qoder 账号，由平台网关判定身份 | 站内账号：`.env` 里的管理员 + 凭一次性邀请码注册的普通用户，登录页在 `#/account` |
 | 数据库 | 平台托管的 PostgreSQL（`app` schema） | 你自己的 PostgreSQL（`public` schema），容器或系统服务均可 |
 | 访问控制 | 站点设为私有，只有受邀者能进 | 页面和题库**公开可读**；只有「同步进度」「改内容」需要登录 |
 | 学习进度 | 存在浏览器 localStorage，绑定 qoder.website 域名 | localStorage 为主，登录后再往服务器备一份快照，可跨设备找回 |
@@ -238,14 +238,56 @@ nano .env
   只有手动 `node deploy/server/index.mjs` 起服务时才需要自己 `export MEDIA_DIR=/某个可写目录`；
   不设也能启动，只是插图接口会回 `upload_unavailable`。
 
-普通用户不需要你建账号：站点上的注册是开放的（`#/account` 页），注册进来就是 `role = user`，
-只能同步自己的学习进度，碰不到题库内容。要把某人提成管理员，在数据库里改 `app_users.role`
+普通用户不需要你建账号，但**需要你先发一个邀请码**：注册是邀请制的（`#/account` 页），
+注册进来就是 `role = user`，只能同步自己的学习进度，碰不到题库内容。邀请码不需要在 `.env`
+里配任何东西，发码流程见第 5b 节。要把某人提成管理员，在数据库里改 `app_users.role`
 （见第 9 节）。
 
 口令请用 `openssl rand -hex 24` 生成，**不要用 `base64`**：base64 会带出 `+` `/` `=`，
 拼进 `DATABASE_URL` 连接串时会被解析错，表现为数据库连不上。
 
 `.env` 是明文口令，`chmod 600`，不要提交进任何版本库、不要发给别人。
+
+---
+
+## 5b. 发邀请码，让别人注册进来
+
+注册是邀请制的：没有码就注册不了。码由管理员在网页里生成，存在 `invite_codes` 表，
+**一次性**——谁用过、什么时候用的都记在码上。
+
+1. 用管理员账号登录 → 导航「内容管理」→ 顶部切到「注册邀请码」这一栏。
+2. 备注框里写这个码是给谁的（例如「发给张三 · 药学一班」，只是给你自己看的，可以留空），
+   点「生成一个」。列表里会多出一行，码显示成 `4T9K-M2XH` 这样每 4 位断一下，方便照着念、照着抄。
+3. 把码发给对方。对方打开站点 → 左下角「登录 / 注册」→ 切到「注册新账号」→ 把码填进去，
+   注册完直接就是登录状态。
+4. 回到「注册邀请码」页点「重新读取」，那一行会变成「已用 · 日期 · 用户名」。
+
+几个要知道的点：
+
+- **一个码只能用一次。** 对方注册成功后码就作废，下一个人要重新生成一个。
+- **手抄容错**：码里没有 `I` `L` `O` `U` 四个字母，`0`/`O`、`1`/`I`、`U`/`V` 看成哪个都认得，
+  大小写和中间的横线也不影响。填错了会明确提示「邀请码不对」，不会静默失败。
+- **发错人了或码泄露了**：那一行点「作废」，码立刻失效（已经注册好的账号不受影响）。
+  用过的那条记录也能删，删的只是记录，不会把账号带走。
+- **删掉账号不会让原来的码复活**，得再发一个新码让他重新注册（见第 9 节）。
+- 猜码基本没用：8 位、32 个符号 = 2^40 种组合；而且同一个来源 IP 一小时内因为
+  「码没填 / 填错 / 已被用过」失败超过 20 次之后，注册接口直接回 429（`too_many_trials`）
+  ——用户名撞车、口令太短这类不算，新手填错几次不会被锁在门外。这个计数只在进程内存里，
+  重启服务就清零，成功注册一次也会清零，所以一间机房共用出口 NAT 时不会互相连累。
+  登录接口不受它影响。
+- 后台列表最多显示最近 500 条。想批量发码就走命令行（接口除了 Cookie 也认 HTTP Basic）：
+
+```bash
+curl -s -u "$ADMIN_USER:$ADMIN_PASSWORD" -X POST \
+  'http://localhost/functions/v1/app?action=create-invite' \
+  -H 'Content-Type: application/json' -d '{"note":"发给李四"}'
+# {"code":"VQ3K7HDM","note":"发给李四"}
+
+curl -s -u "$ADMIN_USER:$ADMIN_PASSWORD" 'http://localhost/functions/v1/app?action=list-invites'
+curl -s -u "$ADMIN_USER:$ADMIN_PASSWORD" -X POST \
+  'http://localhost/functions/v1/app?action=delete-invite' \
+  -H 'Content-Type: application/json' -d '{"code":"VQ3K7HDM"}'   # 作废
+```
 
 ---
 
@@ -297,8 +339,15 @@ sudo systemctl restart cpubiomed                 # 改了 deploy/server/ 下的�
 - [ ] 「账号」页 → 点「从服务器恢复」→ 进度对得上
 - [ ] 「账号」页 → 「退出登录」→ 导航里的「内容管理」消失；手输 `#/admin` 只看到
       「这一页只对管理员开放」，看不到题库条数、同步按钮这些管理信息
-- [ ] 再注册一个新账号（开放注册）→ 登录后导航里同样**没有**「内容管理」；
-      手输 `#/admin` 看到「当前账号没有管理权限」，同样没有任何管理数据
+- [ ] 「内容管理」→ 顶部切到「注册邀请码」→ 备注写「测试用」→ 点「生成一个」→
+      列表里多出一行，码显示成 `XXXX-XXXX` 的样子，状态是「未使用」
+- [ ] 退出登录 → 「登录 / 注册」→ 切到「注册新账号」→ 表单里**多出「邀请码」一栏**；
+      空着提交被浏览器拦下（`required`），乱填一个 8 位的码会提示「邀请码不对」
+- [ ] 用刚才那个码注册（把横线去掉、或者全填小写都能过）→ 注册完直接就是登录状态，
+      导航里同样**没有**「内容管理」；手输 `#/admin` 看到「当前账号没有管理权限」，同样没有任何管理数据
+- [ ] 拿同一个码再注册一个 → 提示「这个邀请码已经被用过了」
+- [ ] 回到管理员账号 →「注册邀请码」→「重新读取」→ 那一行变成「已用 · 日期 · 用户名」
+- [ ] 再生成一个码、不发给任何人、直接点「作废」→ 确认后那一行消失，再用它注册也提示不对
 - [ ] 直接访问 `http://<服务器IP>:8080/` 应该连不上（接口没暴露到公网）
 
 命令行侧的检查：
@@ -307,6 +356,7 @@ sudo systemctl restart cpubiomed                 # 改了 deploy/server/ 下的�
 curl -s -o /dev/null -w '%{http_code}\n' http://localhost/          # 200（页面公开可读）
 curl -s -o /dev/null -w '%{http_code}\n' 'http://localhost/functions/v1/app?action=bank'   # 200
 curl -s -o /dev/null -w '%{http_code}\n' 'http://localhost/functions/v1/app?action=progress'  # 401（没登录）
+curl -s -o /dev/null -w '%{http_code}\n' 'http://localhost/functions/v1/app?action=list-invites'  # 401（邀请码只有管理员能看）
 curl -s -u "$ADMIN_USER:$ADMIN_PASSWORD" 'http://localhost/functions/v1/app?action=bank' | head -c 200
 ```
 
@@ -334,7 +384,8 @@ curl -s -u "$ADMIN_USER:$ADMIN_PASSWORD" 'http://localhost/functions/v1/app?acti
 进度就回来了。这一步**只需要做一次**：新站点上登录账号之后，进度会自动同步到服务器，
 以后换设备只要登同一个账号就能找回来，不用再碰控制台。这一步随时可以做，不影响网站先用起来。
 
-> 顺序上建议：先在新站点注册/登录 → 再做上面这五步把旧进度灌进 localStorage →
+> 顺序上建议：先在新站点登录（管理员直接用 `.env` 里的账号；普通用户要先拿到邀请码才能注册，
+> 见第 5b 节）→ 再做上面这五步把旧进度灌进 localStorage →
 > 灌完刷新页面，登录状态下改动会自动上传到服务器。
 
 ### 7b. 后台手动加过的题
@@ -568,13 +619,20 @@ SELECT user_id, username, display_name, role, created_at FROM app_users ORDER BY
 -- 把某个注册用户提成管理员（角色是每次请求现查数据库的，让他刷新一下页面就会出现「内容管理」）
 UPDATE app_users SET role = 'admin', updated_at = now() WHERE username = '某人';
 
--- 删掉一个账号（user_progress 有 ON DELETE CASCADE，进度会一起删掉）
+-- 删掉一个账号（user_progress 有 ON DELETE CASCADE，进度会一起删掉；
+-- invite_codes.used_by 是 ON DELETE SET NULL，邀请码那行会留着，used_at 仍在）
 DELETE FROM app_users WHERE username = '某人';
+
+-- 看邀请码都发给谁、用没用（used_by 是空但 used_at 有值 = 用过之后账号被删了）
+SELECT code, note, created_at, used_at,
+       (SELECT username FROM app_users u WHERE u.user_id = i.used_by) AS used_by
+FROM invite_codes i ORDER BY created_at DESC;
 ```
 
 口令是 scrypt 散列存的，数据库里看不到原文、也没法直接改。**管理员**改 `.env` 再重启就能重置；
 **普通用户没有找回密码的流程**（没接邮件服务），只能删掉账号让他重新注册——进度会跟着一起没，
 所以删之前可以先 `SELECT data FROM user_progress WHERE user_id = '…'` 存一份。
+删完还要**再发一个新的邀请码**：原来那个码不会因为账号被删就复活（见第 5b 节）。
 
 **升级到带账号体系的新版本**：`schema.sql` 全是 `IF NOT EXISTS`，重复执行安全。
 
@@ -606,7 +664,8 @@ Qoder 站点还在，随时可以用 https://cpu-biomed-q1r9t5025uh.qoder.websit
 
 ## 11. 需要你知道的边界
 
-- **本地验证做到哪一步**：接口逻辑用内存数据库替身跑过 204 项断言（注册/登录/会话签名、
+- **本地验证做到哪一步**：接口逻辑用内存数据库替身跑过 251 项断言（注册/登录/会话签名、
+  邀请码的生成·归一化·一次性消费·并发抢占只成一个·作废·删账号后的残留、按来源 IP 的注册失败限流、
   角色权限、HTTP Basic 兜底、路径穿越防护、全部 action、全部字段校验、进度快照读写与 1 MB 上限、
   353 条真实种子数据灌入、幂等性、后台编辑不被覆盖、图片上传的类型/大小/SVG 拒收与
   `/media/` 托管、离线体检脚本与导入模板自身），全部通过；前端也开着真浏览器把
@@ -615,6 +674,9 @@ Qoder 站点还在，随时可以用 https://cpu-biomed-q1r9t5025uh.qoder.websit
   这一轮新加的富文本部分同样是**真浏览器实测**：后台工具条插图 → 上传 → 地址写回输入框 →
   保存 → `?action=bank` 原样返回 → 刷题页、判分那行、解析面板、错题本的展开区都渲染出
   KaTeX 与 `\ce{}` 化学式，图片取回 200。
+  **邀请码这轮只做了接口级验证**：注册表单新加的「邀请码」栏和后台的「注册邀请码」标签页
+  还没在真浏览器里点过，界面文字、按钮状态和复制码的手感要等你第一次上手时顺手核一下
+  （第 6 节清单里已经列了这几条）。
   **但没有在真实 PostgreSQL / 真实 nginx 上跑过**，本机既没装 Docker 也没有 Linux 环境。
   第 6 节的验证清单第一次在服务器上执行时，才是真正的端到端确认。
 - **公式渲染是 KaTeX，不是完整 LaTeX**：常用数学符号、上下标、分式、根号、矩阵、
@@ -643,10 +705,14 @@ Qoder 站点还在，随时可以用 https://cpu-biomed-q1r9t5025uh.qoder.websit
   80/443 限制到你自己的 IP。
   （代码仓库 `github.com/AeroBeats/cpu_biomed` 是公开的，里面含全量题库——这是你
   2026-10-18 明确选择的，与站点是否公开是两件事。）
-- **注册是开放的，且没有速率限制**：任何能访问站点的人都能注册一个账号，每个账号最多
-  往 `user_progress` 里写 1 MB。熟人小圈子用没问题，公开挂出去就会被人刷账号占空间。
-  要收紧的话，最直接的是在 nginx 上限制来源 IP，或者把注册接口关掉（`deploy/server/handler.mjs`
-  里的 `register` 分支）。
+- **注册改成邀请制了，但它挡不住题库被抓**：没有你发的码就注册不了，一个码只能用一次，
+  所以「被人批量刷账号、往 `user_progress` 里塞垃圾」这条路基本堵住了（何况每个账号上限 1 MB）；
+  猜码另有每小时 20 次失败的来源限流兜着。可是**浏览页面和 `?action=bank` 依然不要任何凭证**，
+  邀请码只管「谁能建账号」，不管「谁能看内容」——想连内容一起锁上，还是得用上一条说的
+  整站加口令或者 nginx / 防火墙限源 IP。
+  另外两点：限流计数只在进程内存里，服务重启就清零（现在只跑一个 Node 进程，够用；
+  将来要是多实例部署，各实例各算各的）；`X-Forwarded-For` 只在连接确实来自回环或内网
+  （也就是我们自己那层 nginx）时才被采信，公网上伪造这个头改不了限流的归属。
 - **退出登录不能吊销已签发的会话**：会话是无状态的 HMAC 签名 Cookie（有效期 30 天），
   「退出」只是清掉本机 Cookie，那串值本身在过期前仍然有效。想让所有已发出的会话立刻失效，
   唯一的办法是换掉 `SESSION_SECRET`（没填它的话，改 `ADMIN_PASSWORD` 也有同样效果，

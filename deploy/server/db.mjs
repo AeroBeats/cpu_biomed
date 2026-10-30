@@ -171,6 +171,55 @@ export function wrap(pool) {
       return rowCount > 0;
     },
 
+    async deleteUser(userId) {
+      // user_progress 级联删掉，invite_codes.used_by 置 NULL（码保持「已用」状态）。
+      const { rowCount } = await query(
+        'DELETE FROM app_users WHERE user_id = $1 RETURNING user_id', [userId]);
+      return rowCount > 0;
+    },
+
+    /* ---- 注册邀请码 ----
+       码一律大写存储，归一化由 validate.mjs 负责，这里只按精确值查。 */
+
+    async findInvite(code) {
+      const { rows } = await query(
+        'SELECT code, used_at FROM invite_codes WHERE code = $1 LIMIT 1', [code]);
+      return rows[0] || null;
+    },
+
+    // 条件更新保证一人一码：并发下第二个写入方拿到 0 行，不会把同码发给两个人。
+    // 条件用 used_at 而不是 used_by：删账号会把 used_by 置空，但码不该因此复活。
+    async claimInvite(code, userId, now) {
+      const { rowCount } = await query(
+        `UPDATE invite_codes SET used_by = $2, used_at = $3
+         WHERE code = $1 AND used_at IS NULL RETURNING code`,
+        [code, userId, now]);
+      return rowCount > 0;
+    },
+
+    async insertInvite(row) {
+      const { rowCount } = await query(
+        `INSERT INTO invite_codes (code, note, created_by, created_at)
+         VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING RETURNING code`,
+        [row.code, row.note, row.created_by, row.created_at]);
+      return rowCount > 0;
+    },
+
+    // used_by 换成用户名再回给界面，一串 uuid 对管理员没有意义。
+    async listInvites(limit) {
+      const { rows } = await query(
+        `SELECT i.code, i.note, i.created_at, i.used_at, u.username AS used_by
+         FROM invite_codes i LEFT JOIN app_users u ON u.user_id = i.used_by
+         ORDER BY i.created_at DESC, i.code DESC LIMIT $1`, [limit]);
+      return rows;
+    },
+
+    async deleteInvite(code) {
+      const { rowCount } = await query(
+        'DELETE FROM invite_codes WHERE code = $1 RETURNING code', [code]);
+      return rowCount > 0;
+    },
+
     async getProgress(userId) {
       const { rows } = await query(
         'SELECT data, updated_at FROM user_progress WHERE user_id = $1 LIMIT 1', [userId]);
