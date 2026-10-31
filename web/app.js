@@ -2648,13 +2648,28 @@
       '</div>';
   }
 
+  // 后端回的字段名与表单 input 名只有昵称这一处对不上。
+  var ACC_INPUT_NAMES = {
+    username: 'username', password: 'password', invite: 'invite', display_name: 'displayName',
+  };
+
+  // 出错那一栏自己带上标记，读屏软件走到它才知道问题在哪。
+  // 整页重绘后也得还在，所以从 state 渲染，而不是只在 accSetMsg 里设一次。
+  function accFieldAttrs(name) {
+    var m = state.account.msg;
+    return m && m.kind === 'err' && m.field === name
+      ? ' aria-invalid="true" aria-describedby="accMsg"' : '';
+  }
+
   function authCard() {
     var a = state.account;
     var reg = a.form === 'register';
     var label = reg ? '注册并登录' : '登录';
-    var msg = a.msg
-      ? '<div class="acc-msg is-' + a.msg.kind + '" id="accMsg">' + esc(a.msg.text) + '</div>'
-      : '<div class="acc-msg" id="accMsg" hidden></div>';
+    // 这条消息是读屏软件唯一的报错播报来源，元素必须一直留在 DOM 里：
+    // 用 hidden 摘掉再挂回来，多数读屏不把它当成 live region 的变化，等于没播报。
+    // 空的时候靠 CSS :empty 收掉外观，不靠 hidden。
+    var msg = '<div class="acc-msg' + (a.msg ? ' is-' + a.msg.kind : '') + '" id="accMsg" role="alert">' +
+      (a.msg ? esc(a.msg.text) : '') + '</div>';
     return '<div class="card acc-card">' +
       '<div class="chip-row" style="margin-bottom:14px">' +
       '<button class="chip" data-act="acc-tab" data-v="login" aria-pressed="' + !reg + '">登录</button>' +
@@ -2664,20 +2679,22 @@
       '<label class="acc-field"><span>用户名</span>' +
       '<input type="text" name="username" autocomplete="username" required minlength="3" maxlength="32" ' +
       'pattern="[A-Za-z0-9_.\\-]{3,32}" placeholder="3–32 位字母、数字或 . _ -" ' +
-      'title="3–32 位字母、数字、点、下划线或短横线">' +
+      'title="3–32 位字母、数字、点、下划线或短横线"' + accFieldAttrs('username') + '>' +
       '<small>不区分大小写，存进数据库时会统一转成小写。</small></label>' +
       (reg ? '<label class="acc-field"><span>邀请码</span>' +
         '<input type="text" name="invite" required maxlength="24" autocomplete="one-time-code" spellcheck="false" ' +
-        'placeholder="管理员发的一次性码，例如 4T9K-M2XH">' +
+        'placeholder="管理员发的一次性码，例如 4T9K-M2XH"' + accFieldAttrs('invite') + '>' +
         '<small>注册需要邀请码（一次性的）。没有的话找管理员要一个。</small></label>' : '') +
       (reg ? '<label class="acc-field"><span>昵称（可选）</span>' +
-        '<input type="text" name="displayName" maxlength="40" autocomplete="nickname" placeholder="留空就用用户名"></label>' : '') +
+        '<input type="text" name="displayName" maxlength="40" autocomplete="nickname" placeholder="留空就用用户名"' +
+        accFieldAttrs('displayName') + '></label>' : '') +
       '<label class="acc-field"><span>口令</span>' +
       '<input type="password" name="password" minlength="8" maxlength="128" required ' +
-      'autocomplete="' + (reg ? 'new-password' : 'current-password') + '" placeholder="至少 8 位"></label>' +
+      'autocomplete="' + (reg ? 'new-password' : 'current-password') + '" placeholder="至少 8 位"' +
+      accFieldAttrs('password') + '></label>' +
       (reg ? '<label class="acc-field"><span>再输一次口令</span>' +
         '<input type="password" name="password2" minlength="8" maxlength="128" required ' +
-        'autocomplete="new-password" placeholder="和上面保持一致"></label>' : '') +
+        'autocomplete="new-password" placeholder="和上面保持一致"' + accFieldAttrs('password2') + '></label>' : '') +
       '<button class="btn btn-primary btn-block" type="submit" id="accSubmit" data-label="' + label + '"' +
       (a.busy ? ' disabled' : '') + '>' + (a.busy ? '处理中…' : label) + '</button>' +
       '</form>' +
@@ -2710,14 +2727,28 @@
       '</div>';
   }
 
-  function accSetMsg(kind, text) {
-    state.account.msg = kind ? { kind: kind, text: text } : null;
+  function accSetMsg(kind, text, inputName) {
+    var name = kind === 'err' && inputName ? inputName : null;
+    state.account.msg = kind ? { kind: kind, text: text, field: name } : null;
     var box = document.getElementById('accMsg');
     // 报错时只改那一行，不整页重绘，免得把用户刚填的内容冲掉。
     if (!box) { render(); return; }
     box.className = 'acc-msg' + (kind ? ' is-' + kind : '');
     box.textContent = text || '';
-    box.hidden = !kind;
+    var form = document.getElementById('accForm');
+    if (!form) return;
+    var inputs = form.querySelectorAll('input');
+    for (var i = 0; i < inputs.length; i++) {
+      if (inputs[i].name === name) {
+        inputs[i].setAttribute('aria-invalid', 'true');
+        inputs[i].setAttribute('aria-describedby', 'accMsg');
+      } else {
+        inputs[i].removeAttribute('aria-invalid');
+        inputs[i].removeAttribute('aria-describedby');
+      }
+    }
+    // 焦点送到出错那一栏，读屏软件会顺着 aria-describedby 把错误再念一遍。
+    if (name && form.elements[name]) form.elements[name].focus();
   }
 
   function accBusy(on) {
@@ -2737,7 +2768,7 @@
     var username = String(f.username.value || '').trim();
     var password = String(f.password.value || '');
     if (reg && password !== String(f.password2.value || '')) {
-      accSetMsg('err', '两次输入的口令不一致。');
+      accSetMsg('err', '两次输入的口令不一致。', 'password2');
       return;
     }
     accSetMsg(null);
@@ -2755,7 +2786,8 @@
       return pullProgress();
     }, function (e) {
       accBusy(false);
-      accSetMsg('err', e && e.message ? e.message : '操作失败，请稍后重试');
+      accSetMsg('err', e && e.message ? e.message : '操作失败，请稍后重试',
+        (e && ACC_INPUT_NAMES[e.field]) || null);
     });
   }
 

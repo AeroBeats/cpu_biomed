@@ -833,7 +833,9 @@ details.reveal .rev-body strong { color: var(--ink); }
   border: 1px solid var(--line); border-left: 3px solid var(--line-2);
   font-size: 13px; line-height: 1.7;
 }
-.acc-msg[hidden] { display: none; }
+/* 空的时候只收掉外观，元素仍留在 DOM 里：live region 一旦被 display:none
+   摘掉，再挂回来时读屏软件多半不播报。 */
+.acc-msg:empty { margin: 0; padding: 0; border: 0; }
 .acc-msg.is-err { background: var(--bad-soft); border-color: var(--pol-line); border-left-color: var(--bad); color: #7A1D17; }
 .acc-msg.is-ok { background: var(--ok-soft); border-color: #BEE0CC; border-left-color: var(--ok); color: #14532D; }
 .btn-block { display: block; width: 100%; text-align: center; margin-top: 4px; }
