@@ -2661,20 +2661,25 @@
       ? ' aria-invalid="true" aria-describedby="accMsg"' : '';
   }
 
+  // 账号页的消息条，登录前后共用：退出登录失败时也得有落脚点，
+  // 否则 accSetMsg 找不到元素，报错只留在 state 里永远显示不出来。
+  // 常驻 + role=alert，空的时候靠 CSS :empty 收起——用 hidden 摘掉再挂回来，
+  // 多数读屏不把它当成 live region 的变化，等于没播报。
+  function accMsgHtml() {
+    var m = state.account.msg;
+    return '<div class="acc-msg' + (m ? ' is-' + m.kind : '') + '" id="accMsg" role="alert">' +
+      (m ? esc(m.text) : '') + '</div>';
+  }
+
   function authCard() {
     var a = state.account;
     var reg = a.form === 'register';
     var label = reg ? '注册并登录' : '登录';
-    // 这条消息是读屏软件唯一的报错播报来源，元素必须一直留在 DOM 里：
-    // 用 hidden 摘掉再挂回来，多数读屏不把它当成 live region 的变化，等于没播报。
-    // 空的时候靠 CSS :empty 收掉外观，不靠 hidden。
-    var msg = '<div class="acc-msg' + (a.msg ? ' is-' + a.msg.kind : '') + '" id="accMsg" role="alert">' +
-      (a.msg ? esc(a.msg.text) : '') + '</div>';
     return '<div class="card acc-card">' +
       '<div class="chip-row" style="margin-bottom:14px">' +
       '<button class="chip" data-act="acc-tab" data-v="login" aria-pressed="' + !reg + '">登录</button>' +
       '<button class="chip" data-act="acc-tab" data-v="register" aria-pressed="' + reg + '">注册新账号</button>' +
-      '</div>' + msg +
+      '</div>' + accMsgHtml() +
       '<form id="accForm">' +
       '<label class="acc-field"><span>用户名</span>' +
       '<input type="text" name="username" autocomplete="username" required minlength="3" maxlength="32" ' +
@@ -2707,7 +2712,7 @@
   function accountCard() {
     var u = state.account.user;
     var admin = isAdmin();
-    return '<div class="card acc-card">' +
+    return '<div class="card acc-card">' + accMsgHtml() +
       '<div class="acc-id">' +
       '<span class="acc-avatar acc-avatar-lg" aria-hidden="true">' + esc(String(u.name || u.username).slice(0, 1)) + '</span>' +
       '<div class="acc-idtext"><b>' + esc(u.name || u.username) + '</b>' +
@@ -2798,6 +2803,7 @@
     window.Cloud.logout().then(function () {
       state.account.user = null;
       state.account.busy = false;
+      state.account.msg = null;              // 别把上一次的退出失败带到登录页去
       sync.status = 'idle'; sync.at = null; sync.dirty = false; sync.message = null;
       clearTimeout(sync.timer);
       toast('已退出登录，进度仍留在这台设备上');
@@ -2876,7 +2882,15 @@
     var t = document.createElement('div');
     t.className = 'toast';
     t.textContent = msg;
+    // 播报交给 #live，这份只负责看；不藏起来的话读屏会把同一句话念两遍。
+    t.setAttribute('aria-hidden', 'true');
     document.body.appendChild(t);
+    var live = document.getElementById('live');
+    if (live) {
+      // 先清空、下一拍再写：连着两次同样的文案，否则不算内容变化，第二次就不播了。
+      live.textContent = '';
+      setTimeout(function () { live.textContent = msg; }, 0);
+    }
     setTimeout(function () {
       t.classList.add('out');
       setTimeout(function () { if (t.parentNode) t.remove(); }, 220);

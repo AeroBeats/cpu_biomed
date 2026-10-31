@@ -83,6 +83,14 @@ a { color: var(--brand); }
 }
 .skip-link:focus { left: 0; }
 
+/* 只给读屏软件看。不能用 display:none 或 visibility:hidden——
+   那样会连同 live region 一起从无障碍树里摘掉，播报就没了。 */
+.sr-only {
+  position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+  overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%);
+  white-space: nowrap; border: 0;
+}
+
 :focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; border-radius: 3px; }
 
 /* ---------- 布局骨架 ---------- */

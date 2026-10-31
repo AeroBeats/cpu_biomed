@@ -61,6 +61,10 @@
 
 <div class="scrim" id="scrim" hidden></div>
 
+<!-- toast 的读屏播报通道。视觉那份 1.9 秒就删了，读屏来不及念，
+     所以播报走这个常驻区域；它必须在内容变化之前就存在。 -->
+<div class="sr-only" id="live" role="status" aria-live="polite" aria-atomic="true"></div>
+
 <script src="data/syllabus.js"></script>
 <script src="data/questions.js"></script>
 <script src="data/flashcards.js"></script>
